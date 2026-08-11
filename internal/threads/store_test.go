@@ -482,7 +482,7 @@ func TestThreadExistsAndAuth(t *testing.T) {
 
 	// Positive: matching filter.
 	matchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "carol"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"carol"`}}},
 	}
 	if err := store.ThreadExistsAndAuth(ctx, threadID, matchFilter); err != nil {
 		t.Errorf("matching filter: %v", err)
@@ -490,7 +490,7 @@ func TestThreadExistsAndAuth(t *testing.T) {
 
 	// Negative: mismatched filter → ErrForbidden.
 	mismatchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "eve"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"eve"`}}},
 	}
 	if err := store.ThreadExistsAndAuth(ctx, threadID, mismatchFilter); err == nil {
 		t.Error("mismatch filter: expected error, got nil")
@@ -686,6 +686,55 @@ func TestStore_Create_AtomicDoNothing_ReturnsSameRow(t *testing.T) {
 	}
 	if m["first"] != true {
 		t.Errorf("do_nothing should return original row metadata, got %v", th2.Metadata)
+	}
+}
+
+// TestStore_Create_DoNothing_AuthFilters proves auth filters are applied to
+// the do_nothing "return pre-existing row" leg (ops.py:832-846): a matching
+// filter returns the existing thread, a mismatching filter surfaces the same
+// ErrAlreadyExists as an unfiltered conflict (ops.py's fetchone(...,
+// not_found_code=409) treats "no row" identically either way).
+func TestStore_Create_DoNothing_AuthFilters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	id := "c1200001-0000-0000-0000-000000000003"
+
+	if _, err := store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		Metadata: []byte(`{"owner":"alice"}`),
+		IfExists: "do_nothing",
+	}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	matching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	second, err := store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		IfExists: "do_nothing",
+		Filters:  matching,
+	})
+	if err != nil {
+		t.Fatalf("do_nothing with matching filter: %v", err)
+	}
+	if second.ThreadID != id {
+		t.Errorf("second.ThreadID = %q, want %q", second.ThreadID, id)
+	}
+
+	mismatching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	_, err = store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		IfExists: "do_nothing",
+		Filters:  mismatching,
+	})
+	if !errors.Is(err, threads.ErrAlreadyExists) {
+		t.Errorf("do_nothing with mismatching filter: want ErrAlreadyExists, got %v", err)
 	}
 }
 

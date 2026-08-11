@@ -224,9 +224,10 @@ func TestService_OnRunCompletedRoundTrip(t *testing.T) {
 }
 
 // TestService_Search_ThreadFilters verifies that thread_filters are accepted and
-// correctly constrain results via an INNER JOIN with the thread table.
-// Crons that have a matching thread pass; crons with no thread (NULL thread_id) are
-// excluded by the INNER JOIN when thread_filters is set.
+// correctly constrain results via a LEFT JOIN with the thread table.
+// Crons with a matching thread pass; crons with no thread (NULL thread_id) are
+// exempt from thread_filters entirely (ops.py:2440-2442: "cron.thread_id IS
+// NULL OR (...)") and are therefore ALSO included.
 func TestService_Search_ThreadFilters(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -244,24 +245,25 @@ func TestService_Search_ThreadFilters(t *testing.T) {
 	tID2 := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"role":"user"}`))
 	testdb.MustInsertCronWithThread(t, ctx, pool, aID, tID2, "0 * * * *")
 
-	// Cron with no thread — excluded by INNER JOIN.
+	// Cron with no thread — exempt from thread_filters, always included.
 	testdb.MustInsertCron(t, ctx, pool, aID, "0 0 * * *")
 
 	resp, err := svc.Search(ctx, &coreapi.SearchCronsRequest{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "admin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Search with thread_filters: %v", err)
 	}
-	if len(resp.GetCrons()) != 1 {
-		t.Errorf("len(crons) = %d, want 1", len(resp.GetCrons()))
+	if len(resp.GetCrons()) != 2 {
+		t.Errorf("len(crons) = %d, want 2 (matching thread + no-thread cron)", len(resp.GetCrons()))
 	}
 }
 
 // TestService_Count_ThreadFilters verifies that thread_filters are accepted and
-// correctly constrain the count via an INNER JOIN with the thread table.
+// correctly constrain the count via a LEFT JOIN with the thread table, exempting
+// no-thread crons from the filter (ops.py:2440-2442).
 func TestService_Count_ThreadFilters(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -279,19 +281,19 @@ func TestService_Count_ThreadFilters(t *testing.T) {
 	tID2 := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"role":"user"}`))
 	testdb.MustInsertCronWithThread(t, ctx, pool, aID, tID2, "0 * * * *")
 
-	// Cron with no thread — excluded by INNER JOIN.
+	// Cron with no thread — exempt from thread_filters, always included.
 	testdb.MustInsertCron(t, ctx, pool, aID, "0 0 * * *")
 
 	resp, err := svc.Count(ctx, &coreapi.CountCronsRequest{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "admin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Count with thread_filters: %v", err)
 	}
-	if resp.GetCount() != 1 {
-		t.Errorf("Count(thread_filters) = %d, want 1", resp.GetCount())
+	if resp.GetCount() != 2 {
+		t.Errorf("Count(thread_filters) = %d, want 2 (matching thread + no-thread cron)", resp.GetCount())
 	}
 }
 
@@ -386,7 +388,7 @@ func TestService_Create_AuthFilters_NotFound(t *testing.T) {
 		},
 		Enabled: true,
 		AssistantFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "charlie"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"charlie"`}}},
 		},
 	})
 	if err == nil {
@@ -421,7 +423,7 @@ func TestService_Create_MissingThread_NotFound(t *testing.T) {
 		ThreadId: &coreapi.UUID{Value: nonexistentThread},
 		Enabled:  true,
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "alice"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
 		},
 	})
 	if err == nil {

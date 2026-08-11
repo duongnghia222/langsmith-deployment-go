@@ -249,7 +249,7 @@ func TestStore_Search_ThreadFilters_Matches(t *testing.T) {
 
 	results, err := store.Search(ctx, crons.SearchInput{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "admin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
 		},
 		Limit: 10,
 	}, nil)
@@ -282,7 +282,7 @@ func TestStore_Search_ThreadFilters_NoMatch(t *testing.T) {
 
 	results, err := store.Search(ctx, crons.SearchInput{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "superadmin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"superadmin"`}}},
 		},
 		Limit: 10,
 	}, nil)
@@ -291,6 +291,40 @@ func TestStore_Search_ThreadFilters_NoMatch(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Errorf("len(results) = %d, want 0", len(results))
+	}
+}
+
+// TestStore_Search_ThreadFilters_ExemptsNullThread proves crons with no
+// thread_id are exempt from thread auth filters (LEFT JOIN thread + "cron.
+// thread_id IS NULL OR (...)" — ops.py:2440-2442), replacing the old INNER
+// JOIN which excluded them outright.
+func TestStore_Search_ThreadFilters_ExemptsNullThread(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "tf-store-nullthread-graph", nil)
+	noThreadCronID := testdb.MustInsertCron(t, ctx, pool, aID, "* * * * *")
+
+	tID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"role":"user"}`))
+	testdb.MustInsertCronWithThread(t, ctx, pool, aID, tID, "0 * * * *")
+
+	results, err := store.Search(ctx, crons.SearchInput{
+		ThreadFilters: []*coreapi.AuthFilter{
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
+		},
+		Limit: 10,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Search with thread_filters: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1 (only the no-thread cron)", len(results))
+	}
+	if results[0].CronID != noThreadCronID {
+		t.Errorf("got cron_id %q, want %q", results[0].CronID, noThreadCronID)
 	}
 }
 
@@ -448,7 +482,7 @@ func TestCronStore_Create_AuthFilters_NotFound(t *testing.T) {
 		Schedule:    "* * * * *",
 		Enabled:     true,
 		AssistantFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "charlie"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"charlie"`}}},
 		},
 	})
 	if err == nil {

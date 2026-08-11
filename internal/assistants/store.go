@@ -103,15 +103,18 @@ const assistantColsAliased = `a.assistant_id::text, COALESCE(a.graph_id, ''),
 	COALESCE(a."name", ''),
 	a.description`
 
-// assistantVersionCols is the SELECT projection for all AssistantVersion fields.
-const assistantVersionCols = `assistant_id::text, COALESCE(graph_id, ''),
-	COALESCE("name", ''),
-	COALESCE("version", 1),
-	created_at,
-	COALESCE(config, '{}'::jsonb)::text::bytea,
-	COALESCE(context, '{}'::jsonb)::text::bytea,
-	COALESCE(metadata, '{}'::jsonb)::text::bytea,
-	description`
+// assistantVersionCols is the SELECT projection for all AssistantVersion fields,
+// qualified with the assistant_versions. prefix: GetVersions optionally JOINs
+// assistant, which has same-named columns (version, graph_id, config, metadata,
+// created_at, context, description, name) that would otherwise be ambiguous.
+const assistantVersionCols = `assistant_versions.assistant_id::text, COALESCE(assistant_versions.graph_id, ''),
+	COALESCE(assistant_versions."name", ''),
+	COALESCE(assistant_versions."version", 1),
+	assistant_versions.created_at,
+	COALESCE(assistant_versions.config, '{}'::jsonb)::text::bytea,
+	COALESCE(assistant_versions.context, '{}'::jsonb)::text::bytea,
+	COALESCE(assistant_versions.metadata, '{}'::jsonb)::text::bytea,
+	assistant_versions.description`
 
 func scanAssistant(row pgx.Row) (*Assistant, error) {
 	var a Assistant
@@ -256,11 +259,14 @@ func (s *Store) Count(ctx context.Context, in SearchInput, filters []*coreapi.Au
 }
 
 // GetVersions returns the version history for the given assistant UUID, ordered
-// by version DESC. Auth filters are applied directly to assistant_versions.metadata,
-// so only versions whose metadata passes the filter are returned. An empty result
-// means either no versions exist or none satisfy the auth filter.
+// by version DESC. Auth filters are applied to the parent assistant's metadata
+// (ops.py:584-599: table_alias="assistant", JOIN assistant USING (assistant_id) —
+// only joined when filters are present), not each version row's own metadata.
+// An empty result means either no versions exist or the assistant is excluded
+// by the auth filter.
 //
-// metadataFilter applies assistant_versions.metadata @> $n::jsonb (ops.py:599).
+// metadataFilter applies assistant_versions.metadata @> $n::jsonb (ops.py:599) —
+// a separate, non-auth containment filter on the version row itself.
 func (s *Store) GetVersions(ctx context.Context, assistantID string, limit, offset uint64, metadataFilter []byte, filters []*coreapi.AuthFilter) ([]*AssistantVersion, error) {
 	if limit == 0 {
 		limit = 100
@@ -278,24 +284,27 @@ func (s *Store) GetVersions(ctx context.Context, assistantID string, limit, offs
 		idx++
 	}
 
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", idx)
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "assistant.metadata", idx)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
+	join := ""
 	if authSQL != "" {
+		join = "JOIN assistant USING (assistant_id)"
 		wheres = append(wheres, authSQL)
 		args = append(args, authArgs...)
 		idx += len(authArgs)
 	}
 
-	whereClause := "assistant_id = $1::uuid"
+	whereClause := "assistant_versions.assistant_id = $1::uuid"
 	if len(wheres) > 0 {
 		whereClause += " AND " + strings.Join(wheres, " AND ")
 	}
 
 	q := fmt.Sprintf(
-		`SELECT %s FROM assistant_versions WHERE %s ORDER BY "version" DESC LIMIT $%d OFFSET $%d`,
+		`SELECT %s FROM assistant_versions %s WHERE %s ORDER BY assistant_versions."version" DESC LIMIT $%d OFFSET $%d`,
 		assistantVersionCols,
+		join,
 		whereClause,
 		idx,
 		idx+1,
@@ -347,6 +356,11 @@ type CreateInput struct {
 	ContextJSON []byte // raw JSONB; nil → '{}'
 	Metadata    []byte // raw JSONB; nil → '{}'
 	IfExists    string // "do_nothing" | "raise" (default) — ops.py:356-374
+
+	// Filters are auth filters applied only to the do_nothing "return
+	// pre-existing row" leg (ops.py:356-371). Not used for raise mode: an
+	// INSERT conflict there already returns ErrAlreadyExists.
+	Filters []*coreapi.AuthFilter
 }
 
 // Create inserts a new assistant and version=1 row atomically using a single CTE,
@@ -428,11 +442,17 @@ SELECT %s FROM inserted_assistant`,
 	// raise (default): empty result set on conflict → ErrAlreadyExists.
 	var q string
 	if in.IfExists == "do_nothing" && in.AssistantID != "" {
+		// Auth filters apply only to this "return pre-existing row" leg.
+		authSQL, authArgs, err := auth.ApplyToQuery(in.Filters, "metadata", len(args)+1)
+		if err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
 		q = insertSQL + fmt.Sprintf(`
 UNION ALL
 SELECT %s FROM assistant
-WHERE assistant_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted_assistant)
-LIMIT 1`, assistantCols)
+WHERE assistant_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted_assistant)%s
+LIMIT 1`, assistantCols, prefixWithAnd(authSQL))
+		args = append(args, authArgs...)
 	} else {
 		q = insertSQL
 	}

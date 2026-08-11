@@ -215,6 +215,10 @@ func mapErr(err error) error {
 	if errors.Is(err, ErrNotFound) {
 		return status.Error(codes.NotFound, err.Error())
 	}
+	// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+	if errors.Is(err, ErrForbidden) {
+		return status.Error(codes.NotFound, err.Error())
+	}
 	return status.Error(codes.Internal, err.Error())
 }
 
@@ -254,6 +258,7 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateThreadRequest) 
 		Metadata:   req.GetMetadataJson(),
 		TTLSeconds: ttlSecs,
 		IfExists:   ifExists,
+		Filters:    req.GetFilters(),
 	})
 	if err != nil {
 		if errors.Is(err, ErrAlreadyExists) {
@@ -391,7 +396,8 @@ func (s *Service) Stream(req *coreapi.StreamThreadRequest, grpcStream coreapi.Th
 	if err := s.store.ThreadExistsAndAuth(ctx, threadID, req.GetFilters()); err != nil {
 		switch {
 		case errors.Is(err, ErrForbidden):
-			return status.Error(codes.PermissionDenied, err.Error())
+			// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+			return status.Error(codes.NotFound, err.Error())
 		case errors.Is(err, ErrNotFound):
 			return status.Error(codes.NotFound, err.Error())
 		default:

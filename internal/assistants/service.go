@@ -191,6 +191,7 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateAssistantReques
 		Name:        req.GetName(),
 		Metadata:    req.GetMetadataJson(),
 		ContextJSON: req.GetContextJson(),
+		Filters:     req.GetFilters(),
 	}
 	if req.GetConfig() != nil {
 		b, err := jsonbutil.Marshal(req.GetConfig())

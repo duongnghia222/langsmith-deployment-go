@@ -160,6 +160,40 @@ func TestStore_Search(t *testing.T) {
 	}
 }
 
+// TestStore_Search_AuthFilterTargetsThreadMetadata proves Search's auth filter
+// is applied against the run's THREAD metadata, not the run's own metadata
+// (ops.py:1911-1946 joins thread and filters thread.metadata). MustInsertRun
+// always inserts run.metadata='{}', so a filter matching only via thread
+// metadata proves the join target; a mismatching thread metadata proves
+// exclusion.
+func TestStore_Search_AuthFilterTargetsThreadMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-auth-search", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+	testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.Search(ctx, runs.SearchInput{Limit: 10}, filters)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].ThreadID != matchThread {
+		t.Errorf("ThreadID = %q, want %q", results[0].ThreadID, matchThread)
+	}
+}
+
 func TestStore_Count(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -875,7 +909,7 @@ func TestPublishExistsAndAuth(t *testing.T) {
 
 	// Auth filter match: owner=alice — must return nil.
 	matchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "alice"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
 	}
 	if err := store.PublishExistsAndAuth(ctx, runID, threadID, matchFilter); err != nil {
 		t.Errorf("matching auth filter: got err %v, want nil", err)
@@ -883,7 +917,7 @@ func TestPublishExistsAndAuth(t *testing.T) {
 
 	// Auth filter mismatch: owner=bob — must return ErrForbidden.
 	mismatchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "bob"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
 	}
 	if err := store.PublishExistsAndAuth(ctx, runID, threadID, mismatchFilter); err == nil {
 		t.Error("mismatch auth filter: expected ErrForbidden, got nil")

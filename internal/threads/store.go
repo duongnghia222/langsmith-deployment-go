@@ -238,6 +238,11 @@ type CreateThreadInput struct {
 	Config     []byte   // raw JSONB; nil → '{}'
 	TTLSeconds *float64 // optional; nil → expires_at = NULL
 	IfExists   string   // "do_nothing" | "raise" (default) — ops.py:832/848
+
+	// Filters are auth filters applied only to the do_nothing "return
+	// pre-existing row" leg (ops.py:832-846). Not used for raise mode: an
+	// INSERT conflict there already returns ErrAlreadyExists.
+	Filters []*coreapi.AuthFilter
 }
 
 // ErrAlreadyExists is returned by Create when if_exists=="raise" and the
@@ -303,6 +308,11 @@ func (s *Store) Create(ctx context.Context, in CreateThreadInput) (*Thread, erro
 	// Python reference: ops.py:820-847.
 	var q string
 	if in.IfExists == "do_nothing" && in.ThreadID != "" {
+		// Auth filters apply only to this "return pre-existing row" leg.
+		authSQL, authArgs, err := auth.ApplyToQuery(in.Filters, "metadata", len(args)+1)
+		if err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
 		// Use the thread_id arg (always $1 when ThreadID != "").
 		q = fmt.Sprintf(`
 WITH inserted AS (
@@ -313,10 +323,11 @@ WITH inserted AS (
 )
 SELECT * FROM inserted
 UNION ALL
-SELECT %s FROM thread WHERE thread_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted)
+SELECT %s FROM thread WHERE thread_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted)%s
 LIMIT 1`,
-			insertCols, insertVals, threadCols, threadCols,
+			insertCols, insertVals, threadCols, threadCols, prefixWithAnd(authSQL),
 		)
+		args = append(args, authArgs...)
 	} else {
 		// raise mode (or no explicit thread_id for do_nothing): plain INSERT.
 		// A duplicate key error from the DB propagates as-is.

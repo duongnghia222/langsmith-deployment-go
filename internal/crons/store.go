@@ -128,10 +128,10 @@ type whereArgsResult struct {
 // whereArgs builds the FROM/WHERE fragment and argument slice shared by Search and Count.
 // idx is the starting $N placeholder index (1-based).
 //
-// When in.ThreadFilters is non-empty an INNER JOIN with the thread table is added.
-// INNER JOIN semantics mean crons with a NULL thread_id are excluded when
-// thread_filters is set — this matches the Python behaviour where thread_filters
-// always constrains to existing threads.
+// When in.ThreadFilters is non-empty a LEFT JOIN with the thread table is added
+// (ops.py:2430-2441). LEFT JOIN + "(c.thread_id IS NULL OR (<thread filter>))"
+// means crons with no thread (NULL thread_id) are exempt from thread_filters —
+// they pass unconditionally — while crons with a thread are still constrained.
 func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, error) {
 	// Determine whether we need to join with the thread table.
 	joinThread := len(in.ThreadFilters) > 0
@@ -140,7 +140,7 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, 
 	// Column prefix for cron-table columns (needed when joining to avoid ambiguity).
 	cp := "" // cron prefix: "" when no join, "c." when joining
 	if joinThread {
-		from = "cron c INNER JOIN thread t ON c.thread_id = t.thread_id"
+		from = "cron c LEFT JOIN thread t ON c.thread_id = t.thread_id"
 		cp = "c."
 	} else {
 		from = "cron c"
@@ -179,14 +179,16 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, 
 		idx += len(authArgs)
 	}
 
-	// Thread auth filters applied to t.metadata via the JOIN.
+	// Thread auth filters applied to t.metadata via the LEFT JOIN. A cron with
+	// no thread (c.thread_id IS NULL) is exempt — it passes regardless of the
+	// filter (ops.py:2441).
 	if joinThread {
 		threadAuthSQL, threadAuthArgs, err := auth.ApplyToQuery(in.ThreadFilters, "t.metadata", idx)
 		if err != nil {
 			return whereArgsResult{}, fmt.Errorf("thread auth: %w", err)
 		}
 		if threadAuthSQL != "" {
-			wheres = append(wheres, threadAuthSQL)
+			wheres = append(wheres, fmt.Sprintf("(c.thread_id IS NULL OR (%s))", threadAuthSQL))
 			args = append(args, threadAuthArgs...)
 			idx += len(threadAuthArgs)
 		}

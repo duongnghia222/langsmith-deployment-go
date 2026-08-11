@@ -182,6 +182,10 @@ func mapErr(err error) error {
 	if errors.Is(err, ErrNotFound) {
 		return status.Error(codes.NotFound, err.Error())
 	}
+	// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+	if errors.Is(err, ErrForbidden) {
+		return status.Error(codes.NotFound, err.Error())
+	}
 	return status.Error(codes.Internal, err.Error())
 }
 
@@ -498,7 +502,8 @@ func (s *Service) Publish(ctx context.Context, req *coreapi.PublishStreamEventRe
 			return nil, status.Error(codes.NotFound, err.Error())
 		}
 		if errors.Is(err, ErrForbidden) {
-			return nil, status.Error(codes.PermissionDenied, err.Error())
+			// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+			return nil, status.Error(codes.NotFound, err.Error())
 		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -712,7 +717,8 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 	if err := s.store.PublishExistsAndAuth(ctx, runID, threadID, joinReq.GetFilters()); err != nil {
 		switch {
 		case errors.Is(err, ErrForbidden):
-			return status.Error(codes.PermissionDenied, err.Error())
+			// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+			return status.Error(codes.NotFound, err.Error())
 		case errors.Is(err, ErrNotFound):
 			if !joinReq.GetIgnoreRunNotFound() {
 				return status.Error(codes.NotFound, err.Error())

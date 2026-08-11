@@ -53,38 +53,35 @@ type Run struct {
 	RunAfter          *time.Time // NULL when after_seconds was 0; deferred-start runs skipped by Next until reached
 }
 
-// runCols is the SELECT projection for all Run fields.
-const runCols = `run_id::text, COALESCE(thread_id::text,''), COALESCE(assistant_id::text,''),
-	COALESCE(status,''),
-	COALESCE(kwargs, '{}'::jsonb)::text::bytea,
-	COALESCE(multitask_strategy, ''),
-	created_at, updated_at,
-	COALESCE(metadata, '{}'::jsonb)::text::bytea,
-	COALESCE(lease_generation, 0),
-	run_after`
+// runCols is the SELECT projection for all Run fields, qualified with the
+// run. prefix: several callers now JOIN thread, which has same-named
+// columns (status, created_at, updated_at, metadata, thread_id) that would
+// otherwise be ambiguous.
+const runCols = `run.run_id::text, COALESCE(run.thread_id::text,''), COALESCE(run.assistant_id::text,''),
+	COALESCE(run.status,''),
+	COALESCE(run.kwargs, '{}'::jsonb)::text::bytea,
+	COALESCE(run.multitask_strategy, ''),
+	run.created_at, run.updated_at,
+	COALESCE(run.metadata, '{}'::jsonb)::text::bytea,
+	COALESCE(run.lease_generation, 0),
+	run.run_after`
 
 // Get returns the run with the given UUID string, optionally scoped to a
-// thread, and applying auth filters to the metadata column.
+// thread, and applying auth filters to the thread's metadata column.
+// Mirrors ops.py:1681-1710, which always JOINs thread USING (thread_id) and
+// filters on thread.metadata (table_alias="thread").
 // Returns ErrNotFound if there is no matching row.
 func (s *Store) Get(ctx context.Context, runID, threadID string, filters []*coreapi.AuthFilter) (*Run, error) {
-	authSQL, args, err := auth.ApplyToQuery(filters, "metadata", 2)
-	if err != nil {
-		return nil, fmt.Errorf("auth: %w", err)
-	}
-
-	extra := prefixAnd(authSQL)
 	if threadID != "" {
-		// thread_id filter shifts the auth arg index by one extra placeholder.
-		// Re-build auth with offset adjusted for the two base args (run_id + thread_id).
-		authSQL2, args2, err := auth.ApplyToQuery(filters, "metadata", 3)
+		authSQL, args, err := auth.ApplyToQuery(filters, "thread.metadata", 3)
 		if err != nil {
 			return nil, fmt.Errorf("auth: %w", err)
 		}
 		q := fmt.Sprintf(
-			`SELECT %s FROM run WHERE run_id = $1::uuid AND thread_id = $2::uuid%s`,
-			runCols, prefixAnd(authSQL2),
+			`SELECT %s FROM run JOIN thread USING (thread_id) WHERE run.run_id = $1::uuid AND run.thread_id = $2::uuid%s`,
+			runCols, prefixAnd(authSQL),
 		)
-		allArgs := append([]any{runID, threadID}, args2...)
+		allArgs := append([]any{runID, threadID}, args...)
 		row := s.pool.QueryRow(ctx, q, allArgs...)
 		var r Run
 		if err := scanRun(row, &r); err != nil {
@@ -96,7 +93,11 @@ func (s *Store) Get(ctx context.Context, runID, threadID string, filters []*core
 		return &r, nil
 	}
 
-	q := fmt.Sprintf(`SELECT %s FROM run WHERE run_id = $1::uuid%s`, runCols, extra)
+	authSQL, args, err := auth.ApplyToQuery(filters, "thread.metadata", 2)
+	if err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+	q := fmt.Sprintf(`SELECT %s FROM run JOIN thread USING (thread_id) WHERE run.run_id = $1::uuid%s`, runCols, prefixAnd(authSQL))
 	allArgs := append([]any{runID}, args...)
 	row := s.pool.QueryRow(ctx, q, allArgs...)
 	var r Run
@@ -118,47 +119,55 @@ type SearchInput struct {
 	Offset         uint64
 }
 
-// whereArgs builds the WHERE fragment and argument slice shared by Search and Count.
-// idx is the starting $N placeholder index (1-based). It returns the complete WHERE
-// clause string (always non-empty — at minimum "TRUE"), the bound args, the next
-// free placeholder index, and any error from auth filter expansion.
-func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, []any, int, error) {
+// whereArgs builds the JOIN and WHERE fragments shared by Search and Count.
+// idx is the starting $N placeholder index (1-based). It returns the JOIN
+// fragment (empty, or "JOIN thread USING (thread_id)"), the complete WHERE
+// clause string (always non-empty — at minimum "TRUE"), the bound args, the
+// next free placeholder index, and any error from auth filter expansion.
+//
+// (ops.py:1928-1931) Auth filters apply to thread.metadata; thread is only
+// joined when filters are present, so a run whose thread was deleted is
+// excluded exactly when ops.py's INNER JOIN would exclude it (no behavior
+// change when no filters are given).
+func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, string, []any, int, error) {
 	args := []any{}
 	wheres := []string{"TRUE"}
 	idx := 1
 
 	if in.ThreadID != "" {
-		wheres = append(wheres, fmt.Sprintf("thread_id = $%d::uuid", idx))
+		wheres = append(wheres, fmt.Sprintf("run.thread_id = $%d::uuid", idx))
 		args = append(args, in.ThreadID)
 		idx++
 	}
 	if len(in.Statuses) > 0 {
-		wheres = append(wheres, fmt.Sprintf("status = ANY($%d::text[])", idx))
+		wheres = append(wheres, fmt.Sprintf("run.status = ANY($%d::text[])", idx))
 		args = append(args, in.Statuses)
 		idx++
 	}
 	if len(in.MetadataFilter) > 0 {
-		wheres = append(wheres, fmt.Sprintf("metadata @> $%d::jsonb", idx))
+		wheres = append(wheres, fmt.Sprintf("run.metadata @> $%d::jsonb", idx))
 		args = append(args, in.MetadataFilter)
 		idx++
 	}
 
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", idx)
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", idx)
 	if err != nil {
-		return "", nil, 0, fmt.Errorf("auth: %w", err)
+		return "", "", nil, 0, fmt.Errorf("auth: %w", err)
 	}
+	join := ""
 	if authSQL != "" {
+		join = "JOIN thread USING (thread_id)"
 		wheres = append(wheres, authSQL)
 		args = append(args, authArgs...)
 		idx += len(authArgs)
 	}
 
-	return strings.Join(wheres, " AND "), args, idx, nil
+	return join, strings.Join(wheres, " AND "), args, idx, nil
 }
 
 // Search returns runs matching the given criteria, ordered by created_at DESC with run_id tiebreaker.
 func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.AuthFilter) ([]*Run, error) {
-	where, args, idx, err := whereArgs(in, filters)
+	join, where, args, idx, err := whereArgs(in, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +177,9 @@ func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.A
 		limit = 100
 	}
 	q := fmt.Sprintf(
-		`SELECT %s FROM run WHERE %s ORDER BY created_at DESC, run_id LIMIT $%d OFFSET $%d`,
+		`SELECT %s FROM run %s WHERE %s ORDER BY run.created_at DESC, run.run_id LIMIT $%d OFFSET $%d`,
 		runCols,
+		join,
 		where,
 		idx, idx+1,
 	)
@@ -194,11 +204,11 @@ func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.A
 
 // Count returns the number of runs matching the given criteria.
 func (s *Store) Count(ctx context.Context, in SearchInput, filters []*coreapi.AuthFilter) (uint64, error) {
-	where, args, _, err := whereArgs(in, filters)
+	join, where, args, _, err := whereArgs(in, filters)
 	if err != nil {
 		return 0, err
 	}
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM run WHERE %s`, where)
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM run %s WHERE %s`, join, where)
 	var n uint64
 	if err := s.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
 		return 0, err
@@ -685,16 +695,21 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 	var q string
 	var args []any
 	if threadID != "" {
-		authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", 3)
+		authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", 3)
 		if err != nil {
 			return "", fmt.Errorf("auth: %w", err)
+		}
+		// (ops.py:1726-1732) thread is only joined when filter_params is non-empty.
+		join := ""
+		if authSQL != "" {
+			join = "JOIN thread USING (thread_id)"
 		}
 		// (item 4) CTE: first select the run, then delete orphaned checkpoint_writes
 		// for the run's checkpoints, then delete the run row itself.
 		// ops.py:1736-1760: selected → del_checkpoint_writes → DELETE FROM run.
 		q = fmt.Sprintf(`
 			WITH selected AS (
-				SELECT run_id FROM run
+				SELECT run_id FROM run %s
 				WHERE run_id = $1::uuid AND thread_id = $2::uuid%s
 			),
 			del_checkpoint_writes AS (
@@ -708,18 +723,22 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 			)
 			DELETE FROM run USING selected WHERE run.run_id = selected.run_id
 			RETURNING run.run_id::text`,
-			prefixAnd(authSQL),
+			join, prefixAnd(authSQL),
 		)
 		args = append([]any{runID, threadID}, authArgs...)
 	} else {
-		authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", 2)
+		authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", 2)
 		if err != nil {
 			return "", fmt.Errorf("auth: %w", err)
+		}
+		join := ""
+		if authSQL != "" {
+			join = "JOIN thread USING (thread_id)"
 		}
 		// (item 4) Same CTE without thread_id scope.
 		q = fmt.Sprintf(`
 			WITH selected AS (
-				SELECT run_id FROM run
+				SELECT run_id FROM run %s
 				WHERE run_id = $1::uuid%s
 			),
 			del_checkpoint_writes AS (
@@ -733,7 +752,7 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 			)
 			DELETE FROM run USING selected WHERE run.run_id = selected.run_id
 			RETURNING run.run_id::text`,
-			prefixAnd(authSQL),
+			join, prefixAnd(authSQL),
 		)
 		args = append([]any{runID}, authArgs...)
 	}
@@ -760,8 +779,9 @@ type CancelResult struct {
 //   - pending + interrupt → status = 'interrupted', cancel_requested_at = now()
 //   - running  (any)      → only cancel_requested_at = now() (worker transitions)
 //
-// Auth filters are applied to run.metadata. Returns the list of CancelResults
-// for matched runs so the caller can publish Redis signals for affected run IDs.
+// Auth filters are applied to the run's thread metadata (ops.py:1824-1832).
+// Returns the list of CancelResults for matched runs so the caller can
+// publish Redis signals for affected run IDs.
 func (s *Store) Cancel(ctx context.Context, runIDs []string, threadID string, filters []*coreapi.AuthFilter) ([]string, error) {
 	results, err := s.CancelWithAction(ctx, runIDs, threadID, "interrupt", filters)
 	if err != nil {
@@ -796,12 +816,19 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 		baseArgs = append(baseArgs, threadID)
 		baseWheres = append(baseWheres, fmt.Sprintf("thread_id = $%d::uuid", len(baseArgs)))
 	}
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", len(baseArgs)+1)
+	// (ops.py:1824-1832) Auth filters apply to thread.metadata; thread would be
+	// JOINed only when filters are present. run/UPDATE/DELETE targets can't
+	// carry an extra JOIN, so we express the same INNER-JOIN exclusion via a
+	// correlated EXISTS against thread (thread_id is thread's PK, so at most
+	// one matching row — same semantics as the JOIN).
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", len(baseArgs)+1)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	if authSQL != "" {
-		baseWheres = append(baseWheres, authSQL)
+		baseWheres = append(baseWheres, fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM thread WHERE thread.thread_id = run.thread_id AND %s)", authSQL,
+		))
 		baseArgs = append(baseArgs, authArgs...)
 	}
 	baseArgs = append(baseArgs, runIDs)
