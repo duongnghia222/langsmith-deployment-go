@@ -153,6 +153,18 @@ make proto-check
 
 SQL migrations live in `internal/db/migrations/` and are embedded into the binary via `go:embed`. `db.Migrate` runs them on startup; there is no separate migrate CLI to invoke. To add one, drop a new pair of `NNNNNNN_<name>.up.sql` / `.down.sql` files following the existing numbering.
 
+## Origins
+
+LSD was built for **on-behalf**, a LangGraph-based multi-agent platform, to replace the
+hosted LangSmith Deployment control plane so the whole stack could be self-hosted. It was
+split out into this repo once it stood on its own; on-behalf now consumes it as a git
+submodule and talks to it over gRPC via `LSD_GRPC_SERVER_ADDRESS`.
+
+on-behalf is still private, so [github.com/duongnghia222/on-behalf](https://github.com/duongnghia222/on-behalf)
+will 404 for now. Nothing here depends on it — the protos are vendored under `proto/`, so
+this server builds, tests and runs standalone. The one exception is `make proto-bootstrap`,
+which re-derives those protos from a Python `langgraph_api` source tree (see "Protos").
+
 ## Observability
 
 - **Metrics** — Prometheus endpoint on `LSD_METRICS_ADDR` (`/metrics`).
