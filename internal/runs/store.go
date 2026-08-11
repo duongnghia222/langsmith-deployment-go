@@ -51,6 +51,7 @@ type Run struct {
 	Metadata          []byte
 	LeaseGeneration   int64
 	RunAfter          *time.Time // NULL when after_seconds was 0; deferred-start runs skipped by Next until reached
+	Attempt           int64      // (2k) number of times Next has claimed this run; distinct from LeaseGeneration fencing
 }
 
 // runCols is the SELECT projection for all Run fields, qualified with the
@@ -64,7 +65,8 @@ const runCols = `run.run_id::text, COALESCE(run.thread_id::text,''), COALESCE(ru
 	run.created_at, run.updated_at,
 	COALESCE(run.metadata, '{}'::jsonb)::text::bytea,
 	COALESCE(run.lease_generation, 0),
-	run.run_after`
+	run.run_after,
+	COALESCE(run.attempt, 0)`
 
 // Get returns the run with the given UUID string, optionally scoped to a
 // thread, and applying auth filters to the thread's metadata column.
@@ -295,6 +297,7 @@ func scanRun(row pgx.Row, r *Run) error {
 		&r.Metadata,
 		&r.LeaseGeneration,
 		&r.RunAfter,
+		&r.Attempt,
 	)
 }
 
@@ -436,6 +439,16 @@ type CreateRunInput struct {
 	IfNotExists int32 // coreapi.CreateRunBehavior enum value
 }
 
+// CreateResult is the return value of Create. InflightRunIDs holds the IDs of
+// runs that were pending/running on the thread at create time under a
+// "rollback"/"interrupt" multitask strategy (ops.py:1834-1899 semantics) —
+// Create itself does not mutate or signal them; the caller (service.Create)
+// applies the same action Cancel would (2d).
+type CreateResult struct {
+	Run            *Run
+	InflightRunIDs []string
+}
+
 // Create inserts a new run row, applying the multitask strategy logic inside a
 // single transaction. Both threadFilters and assistantFilters are validated via
 // EXISTS sub-queries at the SQL level.
@@ -447,14 +460,15 @@ type CreateRunInput struct {
 //     > assistant.config.configurable.user_id > request.user_id
 //   - (item 2) metadata.assistant_id is set via setdefault semantics (ops.py:1502):
 //     caller-provided metadata.assistant_id wins; otherwise assistant_id is injected.
-//   - (item 3) if_not_exists=CREATE_THREAD_IF_THREAD_NOT_EXISTS auto-creates the
-//     thread from assistant config/metadata if it does not exist (ops.py:1527-1558).
+//   - (item 3) if_not_exists=CREATE_THREAD_IF_THREAD_NOT_EXISTS, OR an empty
+//     ThreadID, auto-creates the thread from assistant config/metadata if it
+//     does not exist (ops.py:1527-1560).
 func (s *Store) Create(
 	ctx context.Context,
 	in CreateRunInput,
 	threadFilters []*coreapi.AuthFilter,
 	assistantFilters []*coreapi.AuthFilter,
-) (*Run, error) {
+) (*CreateResult, error) {
 	if in.Status == "" {
 		in.Status = "pending"
 	}
@@ -468,9 +482,25 @@ func (s *Store) Create(
 		in.MultitaskStrategy = "reject"
 	}
 
-	// (item 3) Determine if thread auto-creation is requested.
-	// CreateRunBehavior_CREATE_THREAD_IF_THREAD_NOT_EXISTS = 1
-	createThreadIfMissing := in.IfNotExists == 1
+	// (item 3 / 2b) Determine if thread auto-creation is requested.
+	// CreateRunBehavior_CREATE_THREAD_IF_THREAD_NOT_EXISTS = 1, OR an empty
+	// thread_id (ops.py:1527-1560: thread is auto-created when thread_id is
+	// None *or* if_not_exists == "create").
+	createThreadIfMissing := in.IfNotExists == 1 || in.ThreadID == ""
+
+	// (2c) Request config extracted once from kwargs.config, reused both for
+	// auto-creating a thread and for updating an existing thread below.
+	requestConfig := func() []byte {
+		var kw map[string]any
+		if err2 := json.Unmarshal(in.KwargsJSON, &kw); err2 == nil {
+			if cfg, ok := kw["config"]; ok {
+				if b, err3 := json.Marshal(cfg); err3 == nil {
+					return b
+				}
+			}
+		}
+		return []byte(`{}`)
+	}()
 
 	// Generate a thread ID if none was provided (Python: thread_id or uuid4()).
 	threadID := in.ThreadID
@@ -521,14 +551,15 @@ func (s *Store) Create(
 		if !createThreadIfMissing {
 			return nil, ErrNotFound
 		}
-		// (item 3) Auto-create the thread (ops.py:1527-1548 inserted_thread CTE).
+		// (item 3 / 2b) Auto-create the thread (ops.py:1527-1548 inserted_thread CTE).
 		// Thread metadata is seeded with graph_id+assistant_id from the assistant row.
 		// Thread config is seeded from assistant config merged with request config.
+		// Status is 'busy' (ops.py:1530), not 'idle' — the thread is about to host a run.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO thread (thread_id, status, metadata, config, created_at, updated_at)
 			SELECT
 				$1::uuid,
-				'idle',
+				'busy',
 				jsonb_build_object(
 					'graph_id',      a.graph_id,
 					'assistant_id',  a.assistant_id
@@ -546,18 +577,7 @@ func (s *Store) Create(
 			ON CONFLICT (thread_id) DO NOTHING`,
 			threadID,
 			in.Metadata,
-			// pass request config from kwargs (ops.py:1569 params["config"])
-			func() []byte {
-				var kw map[string]any
-				if err2 := json.Unmarshal(in.KwargsJSON, &kw); err2 == nil {
-					if cfg, ok := kw["config"]; ok {
-						if b, err3 := json.Marshal(cfg); err3 == nil {
-							return b
-						}
-					}
-				}
-				return []byte(`{}`)
-			}(),
+			requestConfig,
 			in.AssistantID,
 		); err != nil {
 			return nil, fmt.Errorf("auto-create thread: %w", err)
@@ -567,7 +587,39 @@ func (s *Store) Create(
 	// Store effective threadID back for multitask checks below.
 	in.ThreadID = threadID
 
-	// Multitask strategy: act on any existing inflight runs.
+	// (2c) Update an existing thread's metadata/config/status on run create
+	// (ops.py:1608-1660 updated_thread CTE). The `status != 'busy'` guard makes
+	// this a no-op for threads just auto-created above (already 'busy').
+	if _, err := tx.Exec(ctx, `
+		UPDATE thread SET
+			metadata = jsonb_set(
+				jsonb_set(thread.metadata, '{graph_id}', to_jsonb(assistant.graph_id)),
+				'{assistant_id}',
+				to_jsonb(assistant.assistant_id)
+			),
+			config = assistant.config
+				|| thread.config
+				|| $3::jsonb
+				|| jsonb_build_object(
+					'configurable',
+						COALESCE(assistant.config -> 'configurable', '{}'::jsonb) ||
+						COALESCE(thread.config -> 'configurable', '{}'::jsonb) ||
+						COALESCE($3::jsonb -> 'configurable', '{}'::jsonb)
+					),
+			status = 'busy'
+		FROM assistant
+		WHERE thread.thread_id = $1::uuid
+		  AND assistant.assistant_id = $2::uuid
+		  AND thread.status != 'busy'`,
+		in.ThreadID, in.AssistantID, requestConfig,
+	); err != nil {
+		return nil, fmt.Errorf("update thread on run create: %w", err)
+	}
+
+	// (2d) Multitask strategy: capture (without mutating) any existing inflight
+	// runs so the caller (service.Create) can apply the same action Cancel
+	// would (interrupt/rollback), including publishing Redis signals.
+	var inflightIDs []string
 	switch in.MultitaskStrategy {
 	case "reject":
 		var inflight bool
@@ -581,12 +633,23 @@ func (s *Store) Create(
 			return nil, ErrInflight
 		}
 	case "rollback", "interrupt":
-		// Mark pending/running runs as interrupted and set cancel_requested_at.
-		if _, err := tx.Exec(ctx,
-			`UPDATE run SET cancel_requested_at = now(), status = 'interrupted', updated_at = now()
-			 WHERE thread_id = $1::uuid AND status IN ('pending', 'running')`,
+		rows, err := tx.Query(ctx,
+			`SELECT run_id::text FROM run WHERE thread_id = $1::uuid AND status IN ('pending', 'running')`,
 			in.ThreadID,
-		); err != nil {
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			inflightIDs = append(inflightIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
 	case "enqueue":
@@ -619,9 +682,16 @@ func (s *Store) Create(
 		in.UserID,            // $8 — user_id fallback (item 1)
 	}
 	runAfterExpr := "NULL"
+	// (2n) created_at defaults to now(); when after_seconds > 0 both run_after
+	// and created_at are pushed to the same future instant (ops.py:1573 sets
+	// created_at from the deferred start time). Reusing the identical
+	// expression/param for both columns guarantees equal values: now() is
+	// stable within a single statement/transaction in Postgres.
+	createdAtExpr := "now()"
 	if in.AfterSeconds > 0 {
 		nextArg := len(insertArgs) + 1
 		runAfterExpr = fmt.Sprintf("(now() + ($%d::bigint * interval '1 second'))", nextArg)
+		createdAtExpr = runAfterExpr
 		insertArgs = append(insertArgs, int64(in.AfterSeconds))
 	}
 	q := fmt.Sprintf(
@@ -666,13 +736,14 @@ func (s *Store) Create(
 			$6,
 			jsonb_build_object('assistant_id', a.assistant_id::text) || $7::jsonb,
 			%s,
-			now(),
+			%s,
 			now()
 		FROM new_id, assistant a, thread t
 		WHERE a.assistant_id = $3::uuid
 		  AND t.thread_id    = $2::uuid
 		RETURNING %s`,
 		runAfterExpr,
+		createdAtExpr,
 		runCols,
 	)
 	var r Run
@@ -682,7 +753,7 @@ func (s *Store) Create(
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &r, nil
+	return &CreateResult{Run: &r, InflightRunIDs: inflightIDs}, nil
 }
 
 // Delete removes the run matching runID (optionally scoped to threadID + auth filters).
@@ -772,6 +843,13 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 type CancelResult struct {
 	RunID   string
 	Deleted bool
+	// Terminal is true when this row just transitioned to a terminal run
+	// status as a result of this call (rollback-delete, or interrupt on a
+	// pending row). It is false for the "running" branch, where only
+	// cancel_requested_at was set and the worker has yet to transition the
+	// run — the caller uses this to decide whether to publish to the run's
+	// terminal-done channel (2f-ii).
+	Terminal bool
 }
 
 // Cancel implements the Python ops.py:1797-1877 cancel semantics per run:
@@ -856,7 +934,7 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 				rows.Close()
 				return nil, err
 			}
-			out = append(out, CancelResult{RunID: id, Deleted: true})
+			out = append(out, CancelResult{RunID: id, Deleted: true, Terminal: true})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -879,7 +957,7 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 				rows.Close()
 				return nil, err
 			}
-			out = append(out, CancelResult{RunID: id, Deleted: false})
+			out = append(out, CancelResult{RunID: id, Deleted: false, Terminal: true})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -973,19 +1051,16 @@ func isTerminalStatus(statusText string) bool {
 	return false
 }
 
-// MarkDone transitions a run to its terminal status and clears the lease columns.
-// If resumable is true the run is marked 'interrupted', otherwise 'success'.
-func (s *Store) MarkDone(ctx context.Context, runID string, resumable bool) error {
-	termStatus := "success"
-	if resumable {
-		termStatus = "interrupted"
-	}
+// MarkDone releases a run's lease without touching its status (ops.py:1417-1437,
+// 2a). The worker/graph execution path is the sole owner of the terminal status
+// transition (via SetStatus); MarkDone must not overwrite it, whatever it is.
+func (s *Store) MarkDone(ctx context.Context, runID string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE run
-		 SET status = $2, updated_at = now(),
+		 SET updated_at = now(),
 		     lease_holder_id = NULL, lease_expires_at = NULL
 		 WHERE run_id = $1::uuid`,
-		runID, termStatus,
+		runID,
 	)
 	return err
 }
@@ -998,7 +1073,9 @@ type ClaimedRun struct {
 
 // Next claims up to limit pending runs using SELECT … FOR UPDATE SKIP LOCKED,
 // sets their status to 'running', stamps lease_expires_at = now() + 5 minutes,
-// and increments lease_generation. Returns the claimed runs with their attempt count.
+// and increments lease_generation. Returns the claimed runs with their attempt
+// count (2k: attempt is the number of times Next has claimed the run — distinct
+// from lease_generation, which Sweep also bumps as a zombie-fencing token).
 func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 	if limit == 0 {
 		limit = 1
@@ -1054,11 +1131,16 @@ func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 		ids[i] = r.RunID
 	}
 	// (item 6) Use s.leaseTTL (from LSD_LEASE_TTL_SECONDS) instead of hardcoded 5 minutes.
+	// (2k) attempt counts claims (bumped here, on every successful Next claim);
+	// lease_generation is a separate fencing token also bumped by Sweep, which
+	// must NOT bump attempt (a swept-and-reclaimed run has been claimed twice,
+	// not three times).
 	if _, err := tx.Exec(ctx,
 		`UPDATE run
 		 SET status = 'running',
 		     lease_expires_at  = now() + ($2::int * INTERVAL '1 second'),
 		     lease_generation  = lease_generation + 1,
+		     attempt           = attempt + 1,
 		     updated_at        = now()
 		 WHERE run_id = ANY($1::uuid[])`,
 		ids, s.leaseTTL,
@@ -1076,7 +1158,7 @@ func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, &ClaimedRun{Run: updated, Attempt: uint64(updated.LeaseGeneration)})
+		out = append(out, &ClaimedRun{Run: updated, Attempt: uint64(updated.Attempt)})
 	}
 	return out, nil
 }

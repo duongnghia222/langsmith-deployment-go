@@ -91,7 +91,7 @@ func main() {
 
 	// (item 6) Wire LSD_REAPER_INTERVAL_SECONDS (cfg.ReaperInterval) into ReaperConfig,
 	// and use a lease-TTL-aware store for the reaper so Sweep/Next use cfg.LeaseTTL.
-	go runs.RunReaper(ctx, runs.NewStoreWithLeaseTTL(pool, int64(cfg.LeaseTTL.Seconds())), log, runs.ReaperConfig{
+	go runs.RunReaper(ctx, runs.NewStoreWithLeaseTTL(pool, int64(cfg.LeaseTTL.Seconds())), rdb.Client, log, runs.ReaperConfig{
 		Interval: cfg.ReaperInterval,
 	})
 	go crons.CronScheduler(ctx, pool, crons.NewStore(pool), runsSvc, log, crons.SchedulerConfig{})
