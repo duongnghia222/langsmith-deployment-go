@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
@@ -485,6 +486,80 @@ func TestRunStore_Delete_WrongThread(t *testing.T) {
 	_, err = store.Get(ctx, rID, "", nil)
 	if err != nil {
 		t.Errorf("run should still exist, got err: %v", err)
+	}
+}
+
+// TestRunStore_Delete_AuthFilter_WithThreadID proves the conditional JOIN
+// thread branch (runs/store.go, threadID != "" path) honors auth filters
+// against thread.metadata: a mismatching filter leaves the run untouched
+// (ErrNotFound, no rows joined), a matching filter deletes it.
+func TestRunStore_Delete_AuthFilter_WithThreadID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-delete-auth-thid", nil)
+	thID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+
+	mismatchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	if _, err := store.Delete(ctx, rID, thID, mismatchFilter); !errors.Is(err, runs.ErrNotFound) {
+		t.Fatalf("Delete with mismatching filter: want ErrNotFound, got %v", err)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); err != nil {
+		t.Errorf("run should survive mismatching filter, Get err: %v", err)
+	}
+
+	matchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	deleted, err := store.Delete(ctx, rID, thID, matchFilter)
+	if err != nil {
+		t.Fatalf("Delete with matching filter: %v", err)
+	}
+	if deleted != rID {
+		t.Errorf("deleted = %q, want %q", deleted, rID)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); !errors.Is(err, runs.ErrNotFound) {
+		t.Errorf("after delete: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestRunStore_Delete_AuthFilter_NoThreadID proves the same auth-filter join
+// in Delete's other branch (runs/store.go, threadID == "" path): a
+// mismatching filter leaves the run untouched, a matching filter deletes it.
+func TestRunStore_Delete_AuthFilter_NoThreadID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-delete-auth-nothid", nil)
+	thID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+
+	mismatchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	if _, err := store.Delete(ctx, rID, "", mismatchFilter); !errors.Is(err, runs.ErrNotFound) {
+		t.Fatalf("Delete with mismatching filter: want ErrNotFound, got %v", err)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); err != nil {
+		t.Errorf("run should survive mismatching filter, Get err: %v", err)
+	}
+
+	matchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	deleted, err := store.Delete(ctx, rID, "", matchFilter)
+	if err != nil {
+		t.Fatalf("Delete with matching filter: %v", err)
+	}
+	if deleted != rID {
+		t.Errorf("deleted = %q, want %q", deleted, rID)
 	}
 }
 
@@ -1017,6 +1092,154 @@ func TestStore_Cancel_InterruptTransitionsPending(t *testing.T) {
 	}
 	if r.Status != "interrupted" {
 		t.Errorf("pending run status after interrupt = %q, want interrupted", r.Status)
+	}
+}
+
+// runCancelRequestedAt reads cancel_requested_at directly since it isn't
+// exposed on the Run struct; used to prove a non-matching run's row was left
+// completely untouched by CancelWithAction's EXISTS-based auth filter (not
+// just that its status is unchanged).
+func runCancelRequestedAt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, runID string) *time.Time {
+	t.Helper()
+	var ts *time.Time
+	if err := pool.QueryRow(ctx, `SELECT cancel_requested_at FROM run WHERE run_id = $1::uuid`, runID).Scan(&ts); err != nil {
+		t.Fatalf("query cancel_requested_at for %s: %v", runID, err)
+	}
+	return ts
+}
+
+// TestStore_CancelWithAction_Interrupt_AuthFilter proves the EXISTS-correlated
+// auth filter (runs/store.go CancelWithAction, ops.py:1824-1832) is honored in
+// both the pending "interrupt" UPDATE and the running-runs UPDATE: a run on a
+// thread matching the filter is affected, a run on a non-matching thread is
+// left completely untouched.
+func TestStore_CancelWithAction_Interrupt_AuthFilter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-cancel-auth-int", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+
+	pendingMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	pendingMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+	runningMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "running")
+	runningMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "running")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.CancelWithAction(ctx,
+		[]string{pendingMatch, pendingMismatch, runningMatch, runningMismatch},
+		"", "interrupt", filters)
+	if err != nil {
+		t.Fatalf("CancelWithAction(interrupt): %v", err)
+	}
+	affected := map[string]bool{}
+	for _, r := range results {
+		affected[r.RunID] = true
+	}
+	if !affected[pendingMatch] || !affected[runningMatch] {
+		t.Errorf("results = %+v, want pendingMatch and runningMatch present", results)
+	}
+	if affected[pendingMismatch] || affected[runningMismatch] {
+		t.Errorf("results = %+v, mismatch-thread runs must not be affected", results)
+	}
+
+	// Matching thread: pending run transitions to interrupted; running run
+	// gets cancel_requested_at set.
+	r, err := store.Get(ctx, pendingMatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMatch: %v", err)
+	}
+	if r.Status != "interrupted" {
+		t.Errorf("pendingMatch status = %q, want interrupted", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMatch) == nil {
+		t.Error("runningMatch cancel_requested_at not set, want set")
+	}
+
+	// Non-matching thread: both runs left completely untouched.
+	r, err = store.Get(ctx, pendingMismatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMismatch: %v", err)
+	}
+	if r.Status != "pending" {
+		t.Errorf("pendingMismatch status = %q, want still pending", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, pendingMismatch) != nil {
+		t.Error("pendingMismatch cancel_requested_at set, want untouched")
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMismatch) != nil {
+		t.Error("runningMismatch cancel_requested_at set, want untouched")
+	}
+}
+
+// TestStore_CancelWithAction_Rollback_AuthFilter proves the same
+// EXISTS-correlated auth filter is honored in both the pending "rollback"
+// DELETE and the running-runs UPDATE: a run on a matching thread is affected,
+// a run on a non-matching thread survives untouched.
+func TestStore_CancelWithAction_Rollback_AuthFilter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-cancel-auth-rb", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+
+	pendingMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	pendingMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+	runningMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "running")
+	runningMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "running")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.CancelWithAction(ctx,
+		[]string{pendingMatch, pendingMismatch, runningMatch, runningMismatch},
+		"", "rollback", filters)
+	if err != nil {
+		t.Fatalf("CancelWithAction(rollback): %v", err)
+	}
+	affected := map[string]bool{}
+	for _, r := range results {
+		affected[r.RunID] = true
+	}
+	if !affected[pendingMatch] || !affected[runningMatch] {
+		t.Errorf("results = %+v, want pendingMatch and runningMatch present", results)
+	}
+	if affected[pendingMismatch] || affected[runningMismatch] {
+		t.Errorf("results = %+v, mismatch-thread runs must not be affected", results)
+	}
+
+	// Matching thread: pending run is hard-deleted; running run gets
+	// cancel_requested_at set.
+	if _, err := store.Get(ctx, pendingMatch, "", nil); !errors.Is(err, runs.ErrNotFound) {
+		t.Errorf("pendingMatch after rollback: want ErrNotFound, got %v", err)
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMatch) == nil {
+		t.Error("runningMatch cancel_requested_at not set, want set")
+	}
+
+	// Non-matching thread: both runs survive completely untouched.
+	r, err := store.Get(ctx, pendingMismatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMismatch: %v", err)
+	}
+	if r.Status != "pending" {
+		t.Errorf("pendingMismatch status = %q, want still pending", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, pendingMismatch) != nil {
+		t.Error("pendingMismatch cancel_requested_at set, want untouched")
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMismatch) != nil {
+		t.Error("runningMismatch cancel_requested_at set, want untouched")
 	}
 }
 
