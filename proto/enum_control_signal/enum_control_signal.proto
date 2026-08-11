@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package enumControlSignal;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_control_signal;enum_control_signal";
+
+enum ControlSignal {
+  unknown = 0;
+  interrupt = 1;
+  rollback = 2;
+  done = 3;
+  subscribed = 4;
+}

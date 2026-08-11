@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package checkpointer;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/checkpointer;checkpointer";
+
+import "google/protobuf/empty.proto";
+import "engine_common/engine-common.proto";
+
+message PutRequest {
+  engineCommon.EngineRunnableConfig config = 1;
+  engineCommon.Checkpoint checkpoint = 2;
+  engineCommon.CheckpointMetadata metadata = 3;
+  map<string, string> new_versions = 4;
+}
+
+message PutWritesRequest {
+  engineCommon.EngineRunnableConfig config = 1;
+  repeated engineCommon.Write writes = 2;
+  string task_id = 3;
+  string task_path = 4;
+}
+
+message Capabilities {
+  bool supports_delete_thread = 1;
+  bool supports_prune = 2;
+  bool supports_delete_for_runs = 3;
+  bool supports_copy_thread = 4;
+}
+
+message ListRequest {
+  engineCommon.EngineRunnableConfig config = 1;
+  bytes filter_json = 2;
+  engineCommon.EngineRunnableConfig before = 3;
+  optional int64 limit = 4;
+}
+
+message DeleteThreadRequest {
+  string thread_id = 1;
+}
+
+message DeleteForRunsRequest {
+  repeated string run_ids = 1;
+}
+
+message CopyThreadRequest {
+  string from_thread_id = 1;
+  string to_thread_id = 2;
+}
+
+message PruneRequest {
+  enum PruneStrategy {
+    UNSPECIFIED = 0;
+    KEEP_LATEST = 1;
+    DELETE_ALL = 2;
+  }
+  repeated string thread_ids = 1;
+  checkpointer.PruneRequest.PruneStrategy strategy = 2;
+}
+
+message GetTupleRequest {
+  engineCommon.EngineRunnableConfig config = 1;
+}
+
+message PutResponse {
+  engineCommon.EngineRunnableConfig next_config = 1;
+}
+
+message ListResponse {
+  repeated engineCommon.CheckpointTuple checkpoint_tuples = 1;
+}
+
+message GetTupleResponse {
+  optional engineCommon.CheckpointTuple checkpoint_tuple = 1;
+}
+
+service Checkpointer {
+  rpc Put (checkpointer.PutRequest) returns (checkpointer.PutResponse);
+  rpc PutWrites (checkpointer.PutWritesRequest) returns (google.protobuf.Empty);
+  rpc GetCapabilities (google.protobuf.Empty) returns (checkpointer.Capabilities);
+  rpc List (checkpointer.ListRequest) returns (checkpointer.ListResponse);
+  rpc GetTuple (checkpointer.GetTupleRequest) returns (checkpointer.GetTupleResponse);
+  rpc DeleteThread (checkpointer.DeleteThreadRequest) returns (google.protobuf.Empty);
+  rpc DeleteForRuns (checkpointer.DeleteForRunsRequest) returns (google.protobuf.Empty);
+  rpc CopyThread (checkpointer.CopyThreadRequest) returns (google.protobuf.Empty);
+  rpc Prune (checkpointer.PruneRequest) returns (google.protobuf.Empty);
+}

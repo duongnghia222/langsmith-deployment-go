@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package enumStoreOperationEntryType;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_store_operation_entry_type;enum_store_operation_entry_type";
+
+enum StoreOperationEntryType {
+  PUT = 0;
+  GET = 1;
+}

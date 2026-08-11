@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package enumStreamMode;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_stream_mode;enum_stream_mode";
+
+enum StreamMode {
+  unknown = 0;
+  values = 1;
+  updates = 2;
+  checkpoints = 3;
+  tasks = 4;
+  debug = 5;
+  messages = 6;
+  custom = 7;
+  events = 8;
+  messages_tuple = 9;
+}

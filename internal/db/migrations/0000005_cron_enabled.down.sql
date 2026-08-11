@@ -1,0 +1,3 @@
+ALTER TABLE cron
+  DROP COLUMN IF EXISTS enabled,
+  DROP COLUMN IF EXISTS timezone;

@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package errors;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/errors;errors";
+
+message UserCodeExecutionError {
+  string error_type = 1;
+  string error_message = 2;
+  string traceback = 3;
+}
+
+message GraphRecursionLimitError {
+  int32 limit = 1;
+}

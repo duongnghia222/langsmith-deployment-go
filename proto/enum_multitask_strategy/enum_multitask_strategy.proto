@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package enumMultitaskStrategy;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy;enum_multitask_strategy";
+
+enum MultitaskStrategy {
+  reject = 0;
+  rollback = 1;
+  interrupt = 2;
+  enqueue = 3;
+}

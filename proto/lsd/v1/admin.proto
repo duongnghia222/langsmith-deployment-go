@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package lsd.v1;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/lsd/v1;lsdv1";
+
+service Admin {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  string version          = 1;  // semver
+  string schema_version   = 2;  // value of lsd_meta('schema_version')
+  repeated string services = 3; // e.g. ["threads","runs"]
+  repeated string features = 4; // e.g. ["threads.crud","runs.crud","runs.lease"]
+}

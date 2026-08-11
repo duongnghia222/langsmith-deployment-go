@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package enumThreadStatus;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_thread_status;enum_thread_status";
+
+enum ThreadStatus {
+  idle = 0;
+  busy = 1;
+  interrupted = 2;
+  error = 3;
+}

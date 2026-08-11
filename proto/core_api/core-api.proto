@@ -1,0 +1,782 @@
+syntax = "proto3";
+
+package coreApi;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/core_api;core_api";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "encryption/encryption.proto";
+import "engine_common/engine-common.proto";
+import "enum_run_status/enum_run_status.proto";
+import "enum_multitask_strategy/enum_multitask_strategy.proto";
+import "enum_stream_mode/enum_stream_mode.proto";
+import "enum_cancel_run_action/enum_cancel_run_action.proto";
+import "enum_thread_status/enum_thread_status.proto";
+import "enum_thread_stream_mode/enum_thread_stream_mode.proto";
+import "enum_control_signal/enum_control_signal.proto";
+import "enum_cron_on_run_completed/enum_cron_on_run_completed.proto";
+
+enum OnConflictBehavior {
+  RAISE = 0;
+  DO_NOTHING = 1;
+}
+
+enum SortOrder {
+  DESC = 0;
+  ASC = 1;
+}
+
+enum AssistantsSortBy {
+  UNSPECIFIED = 0;
+  ASSISTANT_ID = 1;
+  GRAPH_ID = 2;
+  NAME = 3;
+  CREATED_AT = 4;
+  UPDATED_AT = 5;
+}
+
+enum ThreadTTLStrategy {
+  THREAD_TTL_STRATEGY_DELETE = 0;
+  THREAD_TTL_STRATEGY_KEEP_LATEST = 1;
+}
+
+enum CheckpointSource {
+  CHECKPOINT_SOURCE_UNSPECIFIED = 0;
+  CHECKPOINT_SOURCE_INPUT = 1;
+  CHECKPOINT_SOURCE_LOOP = 2;
+  CHECKPOINT_SOURCE_UPDATE = 3;
+  CHECKPOINT_SOURCE_FORK = 4;
+}
+
+enum ThreadsSortBy {
+  THREADS_SORT_BY_UNSPECIFIED = 0;
+  THREADS_SORT_BY_THREAD_ID = 1;
+  THREADS_SORT_BY_CREATED_AT = 2;
+  THREADS_SORT_BY_UPDATED_AT = 3;
+  THREADS_SORT_BY_STATUS = 4;
+  THREADS_SORT_BY_STATE_UPDATED_AT = 5;
+}
+
+enum CreateRunBehavior {
+  REJECT_RUN_IF_THREAD_NOT_EXISTS = 0;
+  CREATE_THREAD_IF_THREAD_NOT_EXISTS = 1;
+}
+
+enum CancelRunStatus {
+  CANCEL_RUN_STATUS_PENDING = 0;
+  CANCEL_RUN_STATUS_RUNNING = 1;
+  CANCEL_RUN_STATUS_ALL = 2;
+}
+
+enum CronsSortBy {
+  CRONS_SORT_BY_UNSPECIFIED = 0;
+  CRONS_SORT_BY_CRON_ID = 1;
+  CRONS_SORT_BY_ASSISTANT_ID = 2;
+  CRONS_SORT_BY_THREAD_ID = 3;
+  CRONS_SORT_BY_NEXT_RUN_DATE = 4;
+  CRONS_SORT_BY_END_TIME = 5;
+  CRONS_SORT_BY_CREATED_AT = 6;
+  CRONS_SORT_BY_UPDATED_AT = 7;
+}
+
+message Tags {
+  repeated string values = 1;
+}
+
+message EqAuthFilter {
+  string key = 1;
+  string match = 2;
+}
+
+message ContainsAuthFilter {
+  string key = 1;
+  repeated string matches = 2;
+}
+
+message OrAuthFilter {
+  repeated coreApi.AuthFilter filters = 1;
+}
+
+message AndAuthFilter {
+  repeated coreApi.AuthFilter filters = 1;
+}
+
+message AuthFilter {
+  oneof filter {
+    coreApi.EqAuthFilter eq = 1;
+    coreApi.ContainsAuthFilter contains = 2;
+    coreApi.OrAuthFilter or_filter = 3;
+    coreApi.AndAuthFilter and_filter = 4;
+  }
+}
+
+message UUID {
+  string value = 1;
+}
+
+message CountResponse {
+  uint64 count = 1;
+}
+
+message StreamEvent {
+  string event_type = 1;
+  bytes message = 2;
+  optional string stream_id = 3;
+}
+
+message Assistant {
+  string assistant_id = 1;
+  string graph_id = 2;
+  uint64 version = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  optional engineCommon.EngineRunnableConfig config = 6;
+  optional bytes context_json = 7;
+  optional bytes metadata_json = 8;
+  string name = 9;
+  optional string description = 10;
+}
+
+message AssistantVersion {
+  string assistant_id = 1;
+  string graph_id = 2;
+  uint64 version = 3;
+  google.protobuf.Timestamp created_at = 4;
+  optional engineCommon.EngineRunnableConfig config = 5;
+  optional bytes context_json = 6;
+  optional bytes metadata_json = 7;
+  string name = 8;
+  optional string description = 9;
+}
+
+message CreateAssistantRequest {
+  string assistant_id = 1;
+  string graph_id = 2;
+  repeated coreApi.AuthFilter filters = 3;
+  coreApi.OnConflictBehavior if_exists = 4;
+  engineCommon.EngineRunnableConfig config = 5;
+  bytes context_json = 6;
+  string name = 7;
+  optional string description = 8;
+  optional bytes metadata_json = 9;
+  optional encryption.EncryptionContext encryption_context = 10;
+}
+
+message GetAssistantRequest {
+  string assistant_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+}
+
+message PatchAssistantRequest {
+  string assistant_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional string graph_id = 3;
+  optional engineCommon.EngineRunnableConfig config = 4;
+  optional bytes context_json = 5;
+  optional string name = 6;
+  optional string description = 7;
+  optional bytes metadata_json = 8;
+  optional encryption.EncryptionContext encryption_context = 9;
+}
+
+message DeleteAssistantRequest {
+  string assistant_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional bool delete_threads = 3;
+}
+
+message DeleteAssistantsResponse {
+  repeated string assistant_ids = 1;
+}
+
+message SetLatestAssistantRequest {
+  string assistant_id = 1;
+  int64 version = 2;
+  repeated coreApi.AuthFilter filters = 3;
+}
+
+message SearchAssistantsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional string graph_id = 2;
+  optional bytes metadata_json = 3;
+  optional uint64 limit = 4;
+  optional uint64 offset = 5;
+  optional coreApi.AssistantsSortBy sort_by = 6;
+  optional coreApi.SortOrder sort_order = 7;
+  repeated string select = 8;
+  optional string name = 9;
+}
+
+message SearchAssistantsResponse {
+  repeated coreApi.Assistant assistants = 1;
+}
+
+message GetAssistantVersionsRequest {
+  string assistant_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional bytes metadata_json = 3;
+  optional uint64 limit = 4;
+  optional uint64 offset = 5;
+}
+
+message GetAssistantVersionsResponse {
+  repeated coreApi.AssistantVersion versions = 1;
+}
+
+message CountAssistantsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional string graph_id = 2;
+  optional bytes metadata_json = 3;
+  optional string name = 4;
+}
+
+message TruncateRequest {
+  bool runs = 1;
+  bool threads = 2;
+  bool assistants = 3;
+  bool checkpointer = 4;
+  bool store = 5;
+}
+
+message ThreadTTLConfig {
+  optional coreApi.ThreadTTLStrategy strategy = 1;
+  optional double default_ttl = 2;
+  optional int32 sweep_interval_minutes = 3;
+}
+
+message ThreadTTLInfo {
+  coreApi.ThreadTTLStrategy strategy = 1;
+  double ttl_minutes = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message Fragment {
+  bytes value = 1;
+}
+
+message CheckpointTask {
+  string id = 1;
+  string name = 2;
+  optional string error = 3;
+  repeated bytes interrupts_json = 4;
+  optional bytes state_json = 5;
+}
+
+message CheckpointMetadata {
+  optional coreApi.CheckpointSource source = 1;
+  optional uint64 step = 2;
+  map<string, string> parents = 3;
+}
+
+message CheckpointPayload {
+  optional engineCommon.EngineRunnableConfig config = 1;
+  coreApi.CheckpointMetadata metadata = 2;
+  bytes values_json = 3;
+  repeated string next = 4;
+  optional engineCommon.EngineRunnableConfig parent_config = 5;
+  repeated coreApi.CheckpointTask tasks = 6;
+}
+
+message ThreadStatusCheckpoint {
+  bytes values_json = 1;
+  repeated string next = 2;
+  bytes interrupts_json = 3;
+}
+
+message Interrupt {
+  optional string id = 1;
+  bytes value = 2;
+  optional string when = 3;
+  optional bool resumable = 4;
+  repeated string ns = 5;
+}
+
+message Interrupts {
+  repeated coreApi.Interrupt interrupts = 1;
+}
+
+message Thread {
+  coreApi.UUID thread_id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  google.protobuf.Timestamp updated_at = 3;
+  coreApi.Fragment metadata = 4;
+  coreApi.Fragment config = 5;
+  enumThreadStatus.ThreadStatus status = 6;
+  coreApi.Fragment values = 7;
+  map<string, coreApi.Interrupts> interrupts = 8;
+  coreApi.Fragment error = 9;
+  google.protobuf.Timestamp state_updated_at = 10;
+  optional bytes extracted_json = 11;
+  optional coreApi.ThreadTTLInfo ttl = 12;
+}
+
+message CreateThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  coreApi.OnConflictBehavior if_exists = 3;
+  optional bytes metadata_json = 4;
+  optional coreApi.ThreadTTLConfig ttl = 5;
+  optional encryption.EncryptionContext encryption_context = 6;
+}
+
+message GetThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional bool include_ttl = 3;
+  optional google.protobuf.FieldMask read_mask = 4;
+}
+
+message PatchThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional bytes metadata_json = 3;
+  optional coreApi.ThreadTTLConfig ttl = 4;
+  optional encryption.EncryptionContext encryption_context = 5;
+  optional google.protobuf.FieldMask read_mask = 6;
+}
+
+message DeleteThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+}
+
+message CopyThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+}
+
+message SearchThreadsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional bytes metadata_json = 2;
+  optional bytes values_json = 3;
+  optional enumThreadStatus.ThreadStatus status = 4;
+  optional uint64 limit = 5;
+  optional uint64 offset = 6;
+  optional coreApi.ThreadsSortBy sort_by = 7;
+  optional coreApi.SortOrder sort_order = 8;
+  repeated string select = 9;
+  repeated coreApi.UUID ids = 10;
+  map<string, string> extract = 11;
+}
+
+message SearchThreadsResponse {
+  repeated coreApi.Thread threads = 1;
+}
+
+message CountThreadsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional bytes metadata_json = 2;
+  optional bytes values_json = 3;
+  optional enumThreadStatus.ThreadStatus status = 4;
+}
+
+message SetThreadStatusRequest {
+  coreApi.UUID thread_id = 1;
+  optional coreApi.ThreadStatusCheckpoint checkpoint = 2;
+  optional bytes exception_json = 3;
+  repeated enumThreadStatus.ThreadStatus expected_status = 4;
+  optional encryption.EncryptionContext encryption_context = 5;
+}
+
+message SetThreadJointStatusRequest {
+  coreApi.UUID thread_id = 1;
+  coreApi.UUID run_id = 2;
+  string run_status = 3;
+  string graph_id = 4;
+  optional coreApi.ThreadStatusCheckpoint checkpoint = 5;
+  optional bytes exception_json = 6;
+  optional encryption.EncryptionContext encryption_context = 7;
+}
+
+message StreamThreadRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  repeated enumThreadStreamMode.ThreadStreamMode stream_modes = 3;
+  optional string last_event_id = 4;
+}
+
+message RunKwargs {
+  optional engineCommon.EngineRunnableConfig config = 1;
+  optional bytes context_json = 2;
+  optional bytes input_json = 3;
+  optional bytes command_json = 4;
+  repeated enumStreamMode.StreamMode stream_mode = 5;
+  optional engineCommon.StaticInterruptConfig interrupt_before = 6;
+  optional engineCommon.StaticInterruptConfig interrupt_after = 7;
+  optional string webhook = 8;
+  repeated string feedback_keys = 9;
+  optional bool temporary = 10;
+  optional bool subgraphs = 11;
+  optional bool resumable = 12;
+  optional bool checkpoint_during = 13;
+  optional string durability = 14;
+}
+
+message Run {
+  coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  coreApi.UUID assistant_id = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  enumRunStatus.RunStatus status = 6;
+  coreApi.Fragment metadata = 7;
+  bytes kwargs_json = 8;
+  enumMultitaskStrategy.MultitaskStrategy multitask_strategy = 9;
+}
+
+message RunStats {
+  uint64 n_pending = 1;
+  uint64 n_running = 2;
+  optional double pending_runs_wait_time_max_secs = 3;
+  optional double pending_runs_wait_time_med_secs = 4;
+  optional double pending_unblocked_runs_wait_time_max_secs = 5;
+}
+
+message PostgresPoolStats {
+  int32 pool_max = 1;
+  int32 pool_size = 2;
+  int32 pool_available = 3;
+  int64 requests_queued = 4;
+  int64 requests_errors = 5;
+}
+
+message RedisPoolStats {
+  int32 idle_connections = 1;
+  int32 in_use_connections = 2;
+  int32 max_connections = 3;
+}
+
+message ConnectionPoolStats {
+  optional coreApi.PostgresPoolStats postgres = 1;
+  optional coreApi.RedisPoolStats redis = 2;
+}
+
+message NextRunRequest {
+  bool wait = 1;
+  uint64 limit = 2;
+}
+
+message RunWithAttempt {
+  coreApi.Run run = 1;
+  uint64 attempt = 2;
+  encryption.EncryptionContext encryption_context = 3;
+}
+
+message NextRunResponse {
+  repeated coreApi.RunWithAttempt runs = 1;
+}
+
+message CreateRunRequest {
+  coreApi.UUID assistant_id = 1;
+  bytes kwargs_json = 2;
+  repeated coreApi.AuthFilter thread_filters = 3;
+  optional coreApi.UUID thread_id = 4;
+  optional string user_id = 5;
+  optional coreApi.UUID run_id = 6;
+  optional enumRunStatus.RunStatus status = 7;
+  optional bytes metadata_json = 8;
+  optional bool prevent_insert_if_inflight = 9;
+  optional enumMultitaskStrategy.MultitaskStrategy multitask_strategy = 10;
+  optional coreApi.CreateRunBehavior if_not_exists = 11;
+  optional uint64 after_seconds = 12;
+  optional coreApi.ThreadTTLConfig thread_ttl = 13;
+  repeated coreApi.AuthFilter assistant_filters = 14;
+  optional encryption.EncryptionContext encryption_context = 15;
+}
+
+message GetRunRequest {
+  coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  repeated coreApi.AuthFilter filters = 3;
+}
+
+message DeleteRunRequest {
+  coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  repeated coreApi.AuthFilter filters = 3;
+}
+
+message CancelRunIdsTarget {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.UUID run_ids = 2;
+}
+
+message CancelStatusTarget {
+  coreApi.CancelRunStatus status = 1;
+}
+
+message CancelRunRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  oneof target {
+    coreApi.CancelRunIdsTarget run_ids = 2;
+    coreApi.CancelStatusTarget status = 3;
+  }
+  optional enumCancelRunAction.CancelRunAction action = 4;
+}
+
+message SearchRunsRequest {
+  coreApi.UUID thread_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional uint64 limit = 3;
+  optional uint64 offset = 4;
+  optional enumRunStatus.RunStatus status = 5;
+  repeated string select = 6;
+}
+
+message SearchRunsResponse {
+  repeated coreApi.Run runs = 1;
+}
+
+message SetRunStatusRequest {
+  coreApi.UUID run_id = 1;
+  enumRunStatus.RunStatus status = 2;
+}
+
+message SweepRunsResponse {
+  repeated coreApi.UUID run_ids = 1;
+}
+
+message CountRunsRequest {
+  coreApi.UUID thread_id = 1;
+  repeated string statuses = 2;
+}
+
+message StreamRunClientMessage {
+  oneof message {
+    coreApi.SubscribeRunRequest subscribe = 1;
+    coreApi.JoinRunRequest join = 2;
+  }
+}
+
+message SubscribeRunRequest {
+  coreApi.UUID thread_id = 1;
+  coreApi.UUID run_id = 2;
+}
+
+message JoinRunRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  repeated enumStreamMode.StreamMode stream_modes = 2;
+  bool ignore_run_not_found = 3;
+  bool cancel_on_disconnect = 4;
+  optional string last_event_id = 5;
+}
+
+message EnterRunRequest {
+  coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  bool resumable = 3;
+}
+
+message MarkRunDoneRequest {
+  coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  bool resumable = 3;
+}
+
+message PublishStreamEventRequest {
+  optional coreApi.UUID run_id = 1;
+  coreApi.UUID thread_id = 2;
+  string event_type = 3;
+  bytes message = 4;
+  bool resumable = 5;
+}
+
+message GetGraphIDRequest {
+  coreApi.UUID thread_id = 1;
+}
+
+message GetGraphIDResponse {
+  optional string graph_id = 1;
+}
+
+message CreateRunResponse {
+  repeated coreApi.Run runs = 1;
+}
+
+message ControlEvent {
+  enumControlSignal.ControlSignal action = 1;
+}
+
+message CronPayload {
+  string assistant_id = 1;
+  optional bytes input_json = 2;
+  optional engineCommon.EngineRunnableConfig config = 3;
+  optional bytes context_json = 4;
+  optional string webhook = 5;
+  optional engineCommon.StaticInterruptConfig interrupt_before = 6;
+  optional engineCommon.StaticInterruptConfig interrupt_after = 7;
+  optional enumMultitaskStrategy.MultitaskStrategy multitask_strategy = 8;
+  optional bytes metadata_json = 9;
+  map<string, bytes> extra_json = 10;
+}
+
+message Cron {
+  coreApi.UUID cron_id = 1;
+  string assistant_id = 2;
+  optional coreApi.UUID thread_id = 3;
+  optional enumCronOnRunCompleted.CronOnRunCompleted on_run_completed = 4;
+  optional google.protobuf.Timestamp end_time = 5;
+  string schedule = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  optional string user_id = 9;
+  coreApi.CronPayload payload = 10;
+  google.protobuf.Timestamp next_run_date = 11;
+  bytes metadata_json = 12;
+  bool enabled = 13;
+  optional string timezone = 14;
+}
+
+message CreateCronRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  string schedule = 2;
+  coreApi.CronPayload payload = 3;
+  bytes metadata_json = 4;
+  optional coreApi.UUID cron_id = 5;
+  optional coreApi.UUID thread_id = 6;
+  optional enumCronOnRunCompleted.CronOnRunCompleted on_run_completed = 7;
+  optional google.protobuf.Timestamp end_time = 8;
+  bool enabled = 9;
+  repeated coreApi.AuthFilter assistant_filters = 10;
+  repeated coreApi.AuthFilter thread_filters = 11;
+  optional string user_id = 12;
+  optional encryption.EncryptionContext encryption_context = 13;
+  optional string timezone = 14;
+}
+
+message DeleteCronRequest {
+  coreApi.UUID cron_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+}
+
+message SearchCronsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional coreApi.UUID assistant_id = 2;
+  optional coreApi.UUID thread_id = 3;
+  optional uint64 limit = 4;
+  optional uint64 offset = 5;
+  optional coreApi.CronsSortBy sort_by = 6;
+  optional coreApi.SortOrder sort_order = 7;
+  repeated string select = 8;
+  optional bool enabled = 9;
+  repeated coreApi.AuthFilter thread_filters = 10;
+}
+
+message SearchCronsResponse {
+  repeated coreApi.Cron crons = 1;
+}
+
+message CountCronsRequest {
+  repeated coreApi.AuthFilter filters = 1;
+  optional coreApi.UUID assistant_id = 2;
+  optional coreApi.UUID thread_id = 3;
+  repeated coreApi.AuthFilter thread_filters = 4;
+}
+
+message PatchCronRequest {
+  coreApi.UUID cron_id = 1;
+  repeated coreApi.AuthFilter filters = 2;
+  optional string schedule = 3;
+  optional google.protobuf.Timestamp end_time = 4;
+  optional bool enabled = 5;
+  optional enumCronOnRunCompleted.CronOnRunCompleted on_run_completed = 6;
+  optional coreApi.CronPayload payload = 7;
+  optional bytes metadata_json = 8;
+  optional encryption.EncryptionContext encryption_context = 9;
+  optional string timezone = 10;
+}
+
+message CronWithNow {
+  coreApi.Cron cron = 1;
+  google.protobuf.Timestamp now = 2;
+  optional encryption.EncryptionContext encryption_context = 3;
+}
+
+message NextCronsResponse {
+  repeated coreApi.CronWithNow crons = 1;
+}
+
+message SetNextRunDateRequest {
+  coreApi.UUID cron_id = 1;
+  google.protobuf.Timestamp next_run_date = 2;
+}
+
+message CacheSetRequest {
+  string key = 1;
+  bytes value = 2;
+  optional google.protobuf.Duration ttl = 3;
+}
+
+message CacheGetRequest {
+  string key = 1;
+}
+
+message CacheGetResponse {
+  optional bytes value = 1;
+}
+
+service Assistants {
+  rpc Get (coreApi.GetAssistantRequest) returns (coreApi.Assistant);
+  rpc Create (coreApi.CreateAssistantRequest) returns (coreApi.Assistant);
+  rpc Patch (coreApi.PatchAssistantRequest) returns (coreApi.Assistant);
+  rpc Delete (coreApi.DeleteAssistantRequest) returns (coreApi.DeleteAssistantsResponse);
+  rpc Search (coreApi.SearchAssistantsRequest) returns (coreApi.SearchAssistantsResponse);
+  rpc SetLatest (coreApi.SetLatestAssistantRequest) returns (coreApi.Assistant);
+  rpc GetVersions (coreApi.GetAssistantVersionsRequest) returns (coreApi.GetAssistantVersionsResponse);
+  rpc Count (coreApi.CountAssistantsRequest) returns (coreApi.CountResponse);
+}
+
+service Admin {
+  rpc Truncate (coreApi.TruncateRequest) returns (google.protobuf.Empty);
+}
+
+service Threads {
+  rpc Create (coreApi.CreateThreadRequest) returns (coreApi.Thread);
+  rpc Get (coreApi.GetThreadRequest) returns (coreApi.Thread);
+  rpc Patch (coreApi.PatchThreadRequest) returns (coreApi.Thread);
+  rpc Delete (coreApi.DeleteThreadRequest) returns (coreApi.UUID);
+  rpc Search (coreApi.SearchThreadsRequest) returns (coreApi.SearchThreadsResponse);
+  rpc Count (coreApi.CountThreadsRequest) returns (coreApi.CountResponse);
+  rpc Copy (coreApi.CopyThreadRequest) returns (coreApi.Thread);
+  rpc SetStatus (coreApi.SetThreadStatusRequest) returns (google.protobuf.Empty);
+  rpc Stream (coreApi.StreamThreadRequest) returns (stream coreApi.StreamEvent);
+  rpc SetJointStatus (coreApi.SetThreadJointStatusRequest) returns (google.protobuf.Empty);
+  rpc GetGraphID (coreApi.GetGraphIDRequest) returns (coreApi.GetGraphIDResponse);
+}
+
+service Runs {
+  rpc Create (coreApi.CreateRunRequest) returns (coreApi.CreateRunResponse);
+  rpc Get (coreApi.GetRunRequest) returns (coreApi.Run);
+  rpc Delete (coreApi.DeleteRunRequest) returns (coreApi.UUID);
+  rpc Search (coreApi.SearchRunsRequest) returns (coreApi.SearchRunsResponse);
+  rpc Cancel (coreApi.CancelRunRequest) returns (google.protobuf.Empty);
+  rpc SetStatus (coreApi.SetRunStatusRequest) returns (google.protobuf.Empty);
+  rpc Stream (stream coreApi.StreamRunClientMessage) returns (stream coreApi.StreamEvent);
+  rpc Publish (coreApi.PublishStreamEventRequest) returns (google.protobuf.Empty);
+  rpc Enter (coreApi.EnterRunRequest) returns (stream coreApi.ControlEvent);
+  rpc MarkDone (coreApi.MarkRunDoneRequest) returns (google.protobuf.Empty);
+  rpc Stats (google.protobuf.Empty) returns (coreApi.RunStats);
+  rpc PoolStats (google.protobuf.Empty) returns (coreApi.ConnectionPoolStats);
+  rpc Count (coreApi.CountRunsRequest) returns (coreApi.CountResponse);
+  rpc Next (coreApi.NextRunRequest) returns (coreApi.NextRunResponse);
+  rpc Sweep (google.protobuf.Empty) returns (coreApi.SweepRunsResponse);
+}
+
+service Crons {
+  rpc Create (coreApi.CreateCronRequest) returns (coreApi.Cron);
+  rpc Patch (coreApi.PatchCronRequest) returns (coreApi.Cron);
+  rpc Delete (coreApi.DeleteCronRequest) returns (google.protobuf.Empty);
+  rpc Search (coreApi.SearchCronsRequest) returns (coreApi.SearchCronsResponse);
+  rpc Count (coreApi.CountCronsRequest) returns (coreApi.CountResponse);
+  rpc Next (google.protobuf.Empty) returns (coreApi.NextCronsResponse);
+  rpc SetNextRunDate (coreApi.SetNextRunDateRequest) returns (google.protobuf.Empty);
+}
+
+service Cache {
+  rpc Set (coreApi.CacheSetRequest) returns (google.protobuf.Empty);
+  rpc Get (coreApi.CacheGetRequest) returns (coreApi.CacheGetResponse);
+}

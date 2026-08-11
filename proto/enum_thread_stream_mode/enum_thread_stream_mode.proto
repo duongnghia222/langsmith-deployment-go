@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package enumThreadStreamMode;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_thread_stream_mode;enum_thread_stream_mode";
+
+enum ThreadStreamMode {
+  unknown = 0;
+  lifecycle = 1;
+  run_modes = 2;
+  state_update = 3;
+}

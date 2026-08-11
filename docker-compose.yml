@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: lsd
+      POSTGRES_USER: lsd
+      POSTGRES_PASSWORD: lsd
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lsd", "-d", "lsd"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - lsd_pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  lsd:
+    build: .
+    environment:
+      LSD_DATABASE_URL: postgres://lsd:lsd@postgres:5432/lsd?sslmode=disable
+      LSD_REDIS_URL: redis://redis:6379/0
+      LSD_GRPC_ADDR: :50051
+      LSD_METRICS_ADDR: :9090
+      LSD_LOG_LEVEL: info
+    ports:
+      - "50051:50051"
+      - "9090:9090"
+    networks:
+      - default
+      - shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+networks:
+  default:
+  shared:
+    name: ${SHARED_NETWORK_NAME:-lsd-shared}
+    external: ${SHARED_NETWORK_EXTERNAL:-false}
+
+volumes:
+  lsd_pg_data:

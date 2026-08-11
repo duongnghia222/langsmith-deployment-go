@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package encryption;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/encryption;encryption";
+
+message EncryptionContext {
+  optional string model = 1;
+  optional string field = 2;
+  map<string, bytes> metadata = 3;
+}
+
+message EncryptJSONRequest {
+  bytes data = 1;
+  encryption.EncryptionContext context = 2;
+}
+
+message DecryptJSONRequest {
+  bytes data = 1;
+  optional string field = 2;
+  optional string model = 3;
+}
+
+message EncryptResponse {
+  bytes data = 1;
+}
+
+message DecryptResponse {
+  bytes data = 1;
+}
+
+service Encryption {
+  rpc EncryptJSON (encryption.EncryptJSONRequest) returns (encryption.EncryptResponse);
+  rpc DecryptJSON (encryption.DecryptJSONRequest) returns (encryption.DecryptResponse);
+}

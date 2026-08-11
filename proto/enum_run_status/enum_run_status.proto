@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package enumRunStatus;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_run_status;enum_run_status";
+
+enum RunStatus {
+  pending = 0;
+  running = 1;
+  error = 2;
+  success = 3;
+  timeout = 4;
+  interrupted = 5;
+  rollback = 6;
+}

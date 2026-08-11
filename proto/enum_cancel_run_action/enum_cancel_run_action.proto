@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package enumCancelRunAction;
+
+option go_package = "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cancel_run_action;enum_cancel_run_action";
+
+enum CancelRunAction {
+  interrupt = 0;
+  rollback = 1;
+}
