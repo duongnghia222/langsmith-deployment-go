@@ -1,14 +1,18 @@
 package crons
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/auth"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -624,6 +628,15 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		idx++
 	}
 	if len(in.Payload) > 0 {
+		// Normalize a legacy protojson-shaped stored payload (pre-4a) to
+		// dict shape before merging (fix round 1, finding 2): merging
+		// dict-shaped patch keys straight into a protojson-shaped row
+		// produces a hybrid that decodePayload's legacy branch (protojson
+		// DiscardUnknown) then silently drops the new keys from on every
+		// future read — the patch would be permanently invisible.
+		if err := s.normalizeLegacyPayload(ctx, cronID); err != nil {
+			return nil, err
+		}
 		// Merge, not replace (4d-ii): payload = payload || $n::jsonb —
 		// ops.py's PATCH sends only the changed run-payload keys.
 		sets = append(sets, fmt.Sprintf("payload = payload || $%d::jsonb", idx))
@@ -659,6 +672,38 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		return nil, err
 	}
 	return &c, nil
+}
+
+// normalizeLegacyPayload rewrites cron.payload from protojson shape (pre-4a)
+// to the Python-dict shape payloadProtoToDict produces, in place, if the
+// stored value is legacy-shaped. No-op for rows already dict-shaped, empty,
+// "{}", or unparseable (best-effort; the subsequent merge proceeds either
+// way — this only prevents the hybrid-shape data loss in finding 2, it
+// isn't itself a source of truth for payload validity).
+func (s *Store) normalizeLegacyPayload(ctx context.Context, cronID string) error {
+	var raw []byte
+	row := s.pool.QueryRow(ctx, `SELECT payload FROM cron WHERE cron_id = $1::uuid`, cronID)
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil || !isLegacyPayloadShape(fields) {
+		return nil
+	}
+	p := &coreapi.CronPayload{}
+	if err := jsonbutil.Unmarshal(trimmed, p); err != nil {
+		return nil
+	}
+	b, err := json.Marshal(payloadProtoToDict(p))
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `UPDATE cron SET payload = $2::jsonb WHERE cron_id = $1::uuid`, cronID, b)
+	return err
 }
 
 // ErrNotFound is returned when a cron is not found or hidden by auth filters.
@@ -746,26 +791,32 @@ func (s *Store) Next(ctx context.Context) ([]*CronWithNow, error) {
 		return nil, closeErr
 	}
 
+	claimed := out[:0] // filter in place: drop rows whose schedule fails to recompute
 	for _, cw := range out {
 		// Base the recompute on the DB-side now() snapshot, matching Python
 		// cron_scheduler.py:131 (cron["now"]).
 		next, err := computeNextRunFrom(cw.Cron.Schedule, cw.Cron.Timezone, cw.Now)
 		if err != nil {
-			// ponytail: schedule is already validated at Create/Patch time, so
-			// this should be unreachable in practice. Leave next_run_date
-			// unadvanced rather than failing the whole claim; the row stays
-			// due and the caller still gets it (and can log the anomaly).
+			// Reachable despite Create/Patch validation via the 4i dialect gap
+			// (croniter accepts L/#/7=Sunday forms robfig can't parse) or rows
+			// written before Go-side validation existed. Drop the row from
+			// this tick's results and log rather than firing it — otherwise,
+			// since next_run_date is left un-advanced, it stays "due" and
+			// would fire again on every future tick forever (fix round 1).
+			slog.Default().Error("cron: unparseable schedule, skipping tick",
+				"cron_id", cw.Cron.CronID, "schedule", cw.Cron.Schedule, "err", err)
 			continue
 		}
 		if _, err := tx.Exec(ctx, `UPDATE cron SET next_run_date = $2 WHERE cron_id = $1::uuid`, cw.Cron.CronID, next); err != nil {
 			return nil, err
 		}
+		claimed = append(claimed, cw)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return claimed, nil
 }
 
 // scanCronWithNow populates a Cron and the trailing now() column from a pgx row.

@@ -10,6 +10,7 @@ import (
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/crons"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -374,6 +375,87 @@ func TestCronStore_Patch_MergesPayloadAndMetadata(t *testing.T) {
 	}
 }
 
+// TestCronStore_Patch_LegacyPayload_RoundTrips verifies fix round 1 finding 2:
+// patching a legacy protojson-shaped row (pre-4a) must not silently discard
+// the patch. Before the fix, merging a dict-shaped patch onto a
+// protojson-shaped row produced a hybrid that decodePayload's legacy branch
+// (protojson Unmarshal with DiscardUnknown:true) then dropped on every
+// subsequent read.
+func TestCronStore_Patch_LegacyPayload_RoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-legacy-graph", nil)
+	cronID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+
+	// Seed a pre-4a protojson-shaped payload directly (Create/Patch always
+	// write the new dict shape, so this must bypass them, matching how a real
+	// legacy row would already exist in the DB).
+	legacy, err := jsonbutil.Marshal(&coreapi.CronPayload{
+		AssistantId: "legacy-graph",
+		InputJson:   []byte(`{"x":1}`),
+	})
+	if err != nil {
+		t.Fatalf("jsonbutil.Marshal: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cron SET payload = $2::jsonb WHERE cron_id = $1::uuid`, cronID, legacy); err != nil {
+		t.Fatalf("seed legacy payload: %v", err)
+	}
+
+	patched, err := store.Patch(ctx, cronID, crons.PatchCronInput{
+		Payload: []byte(`{"newkey":"newval"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(patched.Payload, &payload); err != nil {
+		t.Fatalf("payload not valid JSON: %v", err)
+	}
+	if _, ok := payload["input_json"]; ok {
+		t.Errorf("payload still legacy-shaped after patch: %s", patched.Payload)
+	}
+	var newkey string
+	if err := json.Unmarshal(payload["newkey"], &newkey); err != nil || newkey != "newval" {
+		t.Errorf("payload.newkey = %s, want \"newval\" (patch was discarded)", payload["newkey"])
+	}
+	var assistantID string
+	if err := json.Unmarshal(payload["assistant_id"], &assistantID); err != nil || assistantID != "legacy-graph" {
+		t.Errorf("payload.assistant_id = %s, want \"legacy-graph\" (legacy field lost)", payload["assistant_id"])
+	}
+	var input map[string]int
+	if err := json.Unmarshal(payload["input"], &input); err != nil || input["x"] != 1 {
+		t.Errorf("payload.input = %s, want {\"x\":1} (legacy field lost)", payload["input"])
+	}
+
+	// Re-read via a fresh query to confirm the fix persisted the normalized
+	// shape to storage, not just to Patch's own RETURNING row.
+	reread, err := store.Search(ctx, crons.SearchInput{Limit: 10}, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	found := false
+	for _, c := range reread {
+		if c.CronID != cronID {
+			continue
+		}
+		found = true
+		var rePayload map[string]json.RawMessage
+		if err := json.Unmarshal(c.Payload, &rePayload); err != nil {
+			t.Fatalf("reread payload not valid JSON: %v", err)
+		}
+		if _, ok := rePayload["newkey"]; !ok {
+			t.Errorf("patched key missing on reread: %s", c.Payload)
+		}
+	}
+	if !found {
+		t.Fatalf("cron %s not found on reread", cronID)
+	}
+}
+
 func TestCronStore_Delete_RemovesRow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -629,6 +711,66 @@ func TestCronStore_Next_DbNow(t *testing.T) {
 		if cw.Now.IsZero() {
 			t.Errorf("CronWithNow.Now is zero for cron_id=%s", cw.Cron.CronID)
 		}
+	}
+}
+
+// TestCronStore_Next_SkipsUnparseableSchedule verifies fix round 1 finding 3:
+// a row whose schedule robfig cannot parse (reachable via the 4i croniter/
+// robfig dialect gap, or a pre-validation legacy row) must be dropped from
+// Next's due output rather than fired every tick with next_run_date left
+// un-advanced — which would otherwise refire it forever.
+func TestCronStore_Next_SkipsUnparseableSchedule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "next-badsched-graph", nil)
+
+	// Bypass Create's validation (which would reject this) — matches how a
+	// genuinely unparseable schedule reaches the DB in production (4i dialect
+	// gap, or a row written before Go-side validation existed).
+	badID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "not a cron", true)
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, badID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	// A normal due cron in the same batch, to confirm the bad row doesn't
+	// poison the whole claim.
+	goodID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, goodID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	due, err := store.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	ids := make(map[string]struct{}, len(due))
+	for _, cw := range due {
+		ids[cw.Cron.CronID] = struct{}{}
+	}
+	if _, ok := ids[badID]; ok {
+		t.Errorf("unparseable-schedule cron %s should NOT be returned by Next", badID)
+	}
+	if _, ok := ids[goodID]; !ok {
+		t.Errorf("valid cron %s should be returned by Next", goodID)
+	}
+
+	// The bad row's next_run_date must remain unchanged (still due) — proving
+	// it wasn't silently advanced either; it's simply excluded from firing.
+	var stillDue bool
+	if err := pool.QueryRow(ctx,
+		`SELECT next_run_date <= now() FROM cron WHERE cron_id = $1::uuid`, badID,
+	).Scan(&stillDue); err != nil {
+		t.Fatalf("check next_run_date: %v", err)
+	}
+	if !stillDue {
+		t.Errorf("bad cron's next_run_date should remain due (unchanged), got advanced")
 	}
 }
 
