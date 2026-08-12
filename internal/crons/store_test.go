@@ -1,8 +1,10 @@
 package crons_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -453,6 +455,125 @@ func TestCronStore_Patch_LegacyPayload_RoundTrips(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("cron %s not found on reread", cronID)
+	}
+}
+
+// TestCronStore_Patch_AuthFilters_LegacyRow_NoSideEffect verifies fix round 2
+// finding 1: Patch's read-modify-write of a legacy-shaped payload must be
+// auth-filtered on the read, not just the final UPDATE. Before the fix,
+// normalizeLegacyPayload ran an unfiltered SELECT/UPDATE unconditionally,
+// so a caller whose filters don't match the cron could still trigger a real
+// write (the legacy->dict shape rewrite) before the auth-gated statement
+// ever ran and returned ErrNotFound.
+func TestCronStore_Patch_AuthFilters_LegacyRow_NoSideEffect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-auth-legacy-graph", nil)
+	cronID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+
+	// Patch's auth filters are checked against the cron row's own metadata
+	// (auth.ApplyToQuery(filters, "metadata", 2)), not the assistant's.
+	if _, err := pool.Exec(ctx, `UPDATE cron SET metadata = '{"owner":"alice"}'::jsonb WHERE cron_id = $1::uuid`, cronID); err != nil {
+		t.Fatalf("set metadata: %v", err)
+	}
+
+	legacy, err := jsonbutil.Marshal(&coreapi.CronPayload{
+		AssistantId: "legacy-graph",
+		InputJson:   []byte(`{"x":1}`),
+	})
+	if err != nil {
+		t.Fatalf("jsonbutil.Marshal: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cron SET payload = $2::jsonb WHERE cron_id = $1::uuid`, cronID, legacy); err != nil {
+		t.Fatalf("seed legacy payload: %v", err)
+	}
+	var before []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM cron WHERE cron_id = $1::uuid`, cronID).Scan(&before); err != nil {
+		t.Fatalf("read seeded payload: %v", err)
+	}
+
+	// Filter that doesn't match the cron's metadata (owner=alice, not bob).
+	_, err = store.Patch(ctx, cronID, crons.PatchCronInput{
+		Payload: []byte(`{"newkey":"newval"}`),
+	}, []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	})
+	if err != crons.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+
+	var after []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM cron WHERE cron_id = $1::uuid`, cronID).Scan(&after); err != nil {
+		t.Fatalf("read payload after rejected patch: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("payload mutated by unauthorized Patch attempt: before=%s after=%s", before, after)
+	}
+}
+
+// TestCronStore_Patch_LegacyPayload_ConcurrentPatchesAllPersist verifies fix
+// round 2 finding 2: concurrent Patch calls against the same still-legacy
+// row must not lose each other's merged keys. Before the fix,
+// normalizeLegacyPayload's SELECT-then-UPDATE ran outside any lock, so two
+// interleaved normalize-then-merge cycles could each read the same
+// pre-normalization payload and one's write would clobber the other's.
+func TestCronStore_Patch_LegacyPayload_ConcurrentPatchesAllPersist(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-legacy-concurrent-graph", nil)
+	cronID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+
+	legacy, err := jsonbutil.Marshal(&coreapi.CronPayload{
+		AssistantId: "legacy-graph",
+		InputJson:   []byte(`{"x":1}`),
+	})
+	if err != nil {
+		t.Fatalf("jsonbutil.Marshal: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cron SET payload = $2::jsonb WHERE cron_id = $1::uuid`, cronID, legacy); err != nil {
+		t.Fatalf("seed legacy payload: %v", err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := store.Patch(ctx, cronID, crons.PatchCronInput{
+				Payload: []byte(fmt.Sprintf(`{"key%d":%d}`, i, i)),
+			}, nil); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("Patch: %v", err)
+	}
+
+	var raw []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM cron WHERE cron_id = $1::uuid`, cronID).Scan(&raw); err != nil {
+		t.Fatalf("read final payload: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("payload not valid JSON: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key%d", i)
+		var v int
+		if raw, ok := payload[key]; !ok || json.Unmarshal(raw, &v) != nil || v != i {
+			t.Errorf("payload missing/wrong %q (concurrent patch lost); full payload: %s", key, payload)
+		}
 	}
 }
 

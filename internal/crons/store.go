@@ -627,20 +627,46 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		args = append(args, *in.EndTime)
 		idx++
 	}
+	// A payload patch needs to read-modify-write the row: legacy
+	// protojson-shaped rows (pre-4a) must be converted to dict shape before
+	// the patch is folded in, or the patch keys are silently dropped on
+	// every future read (fix round 1, finding 2). That read-modify-write
+	// must run under a lock held across both the read and Patch's own final
+	// UPDATE (fix round 2, finding 2 — otherwise two concurrent Patch calls
+	// on the same legacy row race and one's merge is lost), and the read
+	// must itself be auth-filtered, not just the final UPDATE (fix round 2,
+	// finding 1 — otherwise an unauthorized caller can trigger the shape
+	// rewrite as a side effect before the auth check ever runs).
+	var querier interface {
+		QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	} = s.pool
+	var tx pgx.Tx
 	if len(in.Payload) > 0 {
-		// Normalize a legacy protojson-shaped stored payload (pre-4a) to
-		// dict shape before merging (fix round 1, finding 2): merging
-		// dict-shaped patch keys straight into a protojson-shaped row
-		// produces a hybrid that decodePayload's legacy branch (protojson
-		// DiscardUnknown) then silently drops the new keys from on every
-		// future read — the patch would be permanently invisible.
-		if err := s.normalizeLegacyPayload(ctx, cronID); err != nil {
+		tx, err = s.pool.Begin(ctx)
+		if err != nil {
 			return nil, err
 		}
-		// Merge, not replace (4d-ii): payload = payload || $n::jsonb —
-		// ops.py's PATCH sends only the changed run-payload keys.
-		sets = append(sets, fmt.Sprintf("payload = payload || $%d::jsonb", idx))
-		args = append(args, in.Payload)
+		defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+		querier = tx
+
+		lockQ := fmt.Sprintf(`SELECT payload FROM cron WHERE cron_id = $1::uuid%s FOR UPDATE`, prefixWithAnd(authSQL))
+		var raw []byte
+		if err := tx.QueryRow(ctx, lockQ, append([]any{cronID}, authArgs...)...).Scan(&raw); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		merged, err := mergePayload(raw, in.Payload)
+		if err != nil {
+			return nil, err
+		}
+		// Full replace, not `||`: merged already folds the (possibly
+		// legacy-converted) locked payload together with the patch. An
+		// SQL-side `||` here would re-read the column itself and reopen the
+		// exact race the row lock above is meant to close.
+		sets = append(sets, fmt.Sprintf("payload = $%d::jsonb", idx))
+		args = append(args, merged)
 		idx++
 	}
 	if len(in.Metadata) > 0 {
@@ -665,45 +691,64 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		cronCols,
 	)
 	var c Cron
-	if err := scanCron(s.pool.QueryRow(ctx, q, finalArgs...), &c); err != nil {
+	if err := scanCron(querier.QueryRow(ctx, q, finalArgs...), &c); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return &c, nil
 }
 
-// normalizeLegacyPayload rewrites cron.payload from protojson shape (pre-4a)
-// to the Python-dict shape payloadProtoToDict produces, in place, if the
-// stored value is legacy-shaped. No-op for rows already dict-shaped, empty,
-// "{}", or unparseable (best-effort; the subsequent merge proceeds either
-// way — this only prevents the hybrid-shape data loss in finding 2, it
-// isn't itself a source of truth for payload validity).
-func (s *Store) normalizeLegacyPayload(ctx context.Context, cronID string) error {
-	var raw []byte
-	row := s.pool.QueryRow(ctx, `SELECT payload FROM cron WHERE cron_id = $1::uuid`, cronID)
-	if err := row.Scan(&raw); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
+// mergePayload folds a payload patch onto a stored payload, converting the
+// stored value from legacy protojson shape (pre-4a) to the Python-dict shape
+// payloadProtoToDict produces first if needed — same shallow-merge semantics
+// as the JSONB `||` operator (patch keys win on collision, everything else
+// from the stored value is kept), just computed in Go against an
+// already-locked read so the caller can write the result back with a plain
+// `=` instead of a second `||` that would re-read the column and reopen the
+// race the lock is for. rawStored empty, "{}", or unparseable-as-legacy-JSON
+// is treated as an empty base (best-effort, matching the prior behavior this
+// replaces).
+func mergePayload(rawStored, patch []byte) ([]byte, error) {
+	base := map[string]json.RawMessage{}
+	trimmed := bytes.TrimSpace(rawStored)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(`{}`)) {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &fields); err == nil {
+			base = fields
+			if isLegacyPayloadShape(fields) {
+				p := &coreapi.CronPayload{}
+				if err := jsonbutil.Unmarshal(trimmed, p); err == nil {
+					converted := map[string]json.RawMessage{}
+					for k, v := range payloadProtoToDict(p) {
+						b, err := json.Marshal(v)
+						if err != nil {
+							return nil, err
+						}
+						converted[k] = b
+					}
+					base = converted
+				}
+				// Unparseable legacy JSON falls back to the raw fields
+				// as-is rather than dropping them.
+			}
 		}
-		return err
 	}
-	trimmed := bytes.TrimSpace(raw)
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &fields); err != nil || !isLegacyPayloadShape(fields) {
-		return nil
+
+	var patchFields map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &patchFields); err != nil {
+		return nil, fmt.Errorf("payload patch: %w", err)
 	}
-	p := &coreapi.CronPayload{}
-	if err := jsonbutil.Unmarshal(trimmed, p); err != nil {
-		return nil
+	for k, v := range patchFields {
+		base[k] = v
 	}
-	b, err := json.Marshal(payloadProtoToDict(p))
-	if err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `UPDATE cron SET payload = $2::jsonb WHERE cron_id = $1::uuid`, cronID, b)
-	return err
+	return json.Marshal(base)
 }
 
 // ErrNotFound is returned when a cron is not found or hidden by auth filters.
