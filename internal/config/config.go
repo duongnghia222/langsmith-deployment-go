@@ -19,7 +19,10 @@ type Config struct {
 	ReaperInterval         time.Duration
 	NextPollInterval       time.Duration
 	ThreadTTLSweepInterval time.Duration
-	LogLevel               string
+	// CronInterval is the scheduler tick cadence. Python reference:
+	// CRON_SCHEDULER_SLEEP_TIME=5 (api/config/__init__.py:427).
+	CronInterval time.Duration
+	LogLevel     string
 	Env                    string
 
 	// StreamCfg controls Redis Streams behaviour (R4).
@@ -54,6 +57,7 @@ func Load() (*Config, error) {
 		ReaperInterval:         getEnvSeconds("LSD_REAPER_INTERVAL_SECONDS", 2*time.Second),
 		NextPollInterval:       getEnvSeconds("LSD_NEXT_POLL_INTERVAL_SECONDS", 1*time.Second),
 		ThreadTTLSweepInterval: getEnvSeconds("LSD_THREAD_TTL_SWEEP_INTERVAL_SECONDS", 60*time.Second),
+		CronInterval:           getEnvSeconds("LSD_CRON_INTERVAL_SECONDS", 5*time.Second),
 		LogLevel:               getEnv("LSD_LOG_LEVEL", "info"),
 		Env:                    getEnv("LSD_ENV", "prod"),
 		StreamMaxLen:           getEnvInt64("LSD_STREAM_MAX_LEN", 1000),

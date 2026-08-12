@@ -1,7 +1,9 @@
 package crons
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
@@ -10,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -159,19 +160,38 @@ func toPB(c *Cron) *coreapi.Cron {
 }
 
 // decodePayload deserializes the cron.payload JSONB column into CronPayload.
-// Returns (nil, false) for empty/{} so legacy Python-dict rows degrade cleanly.
+// Returns (nil, false) for empty/{} so a cron with no payload degrades cleanly.
+//
+// New rows (4a) store payload as the Python-shaped dict crons.py's
+// _payload_proto_to_dict produces (payloadDictToProto is its Go inverse).
+// Rows written before 4a are protojson-shaped CronPayload messages instead;
+// they're detected by the presence of "input_json"/"extra_json" — proto
+// field names a Python payload dict would never carry at the top level —
+// and parsed via jsonbutil as before.
 func decodePayload(raw []byte) (*coreapi.CronPayload, bool) {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) {
 		return nil, false
 	}
-	p := &coreapi.CronPayload{}
-	if err := jsonbutil.Unmarshal(raw, p); err != nil {
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil || len(fields) == 0 {
 		return nil, false
 	}
-	if proto.Equal(p, &coreapi.CronPayload{}) {
+
+	if isLegacyPayloadShape(fields) {
+		p := &coreapi.CronPayload{}
+		if err := jsonbutil.Unmarshal(trimmed, p); err != nil {
+			return nil, false
+		}
+		return p, true
+	}
+
+	var dict map[string]any
+	if err := json.Unmarshal(trimmed, &dict); err != nil {
 		return nil, false
 	}
-	return p, true
+	return payloadDictToProto(dict), true
 }
 
 // Create implements CronsServer.Create.
@@ -194,7 +214,10 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateCronRequest) (*
 	}
 	if p := req.GetPayload(); p != nil {
 		in.AssistantID = p.GetAssistantId()
-		b, err := jsonbutil.Marshal(p)
+		// 4a: store the Python-shaped dict (crons.py:_payload_proto_to_dict),
+		// not protojson, so storage/ops.py's raw-SQL fallbacks and the gRPC
+		// client agree on payload shape.
+		b, err := json.Marshal(payloadProtoToDict(p))
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
@@ -236,8 +259,8 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateCronRequest) (*
 // Invalid schedule → codes.InvalidArgument ("Invalid cron schedule").
 func (s *Service) Patch(ctx context.Context, req *coreapi.PatchCronRequest) (*coreapi.Cron, error) {
 	in := PatchCronInput{
-		Schedule: req.GetSchedule(), // proto Schedule is optional *string; getter returns "" when nil → store skips empty
-		Timezone: req.GetTimezone(), // same
+		Schedule: req.GetSchedule(),     // proto Schedule is optional *string; getter returns "" when nil → store skips empty
+		Timezone: req.GetTimezone(),     // same
 		Metadata: req.GetMetadataJson(), // same — store skips empty bytes
 	}
 	if req.Enabled != nil { // honor optionality
@@ -249,7 +272,8 @@ func (s *Service) Patch(ctx context.Context, req *coreapi.PatchCronRequest) (*co
 		in.EndTime = &t
 	}
 	if p := req.GetPayload(); p != nil {
-		b, err := jsonbutil.Marshal(p)
+		// 4a: same Python-shaped-dict encoding as Create.
+		b, err := json.Marshal(payloadProtoToDict(p))
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
@@ -284,8 +308,14 @@ func isScheduleParseErr(err error) bool {
 }
 
 // Delete implements CronsServer.Delete.
+//
+// 4f: zero rows affected (not found / not authorized) → codes.NotFound, so
+// the client only yields the cron_id on an actual delete.
 func (s *Service) Delete(ctx context.Context, req *coreapi.DeleteCronRequest) (*emptypb.Empty, error) {
 	if err := s.store.Delete(ctx, req.GetCronId().GetValue(), req.GetFilters()); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Error(codes.NotFound, "Cron not found or not authorized")
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &emptypb.Empty{}, nil

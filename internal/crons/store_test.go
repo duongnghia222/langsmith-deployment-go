@@ -2,6 +2,8 @@ package crons_test
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -163,6 +165,61 @@ func TestCronStore_Create_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestCronStore_Create_Idempotent verifies 4e: calling Create twice with the
+// same CronID returns the same pre-existing row instead of erroring on a
+// unique violation or creating a duplicate (ops.py:2237-2260's
+// ON CONFLICT (cron_id) DO NOTHING + UNION ALL fallback SELECT).
+func TestCronStore_Create_Idempotent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "idempotent-graph", nil)
+
+	first, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID: aID,
+		Schedule:    "*/5 * * * *",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	second, err := store.Create(ctx, crons.CreateCronInput{
+		CronID:      first.CronID,
+		AssistantID: aID,
+		Schedule:    "0 * * * *", // different from first; must be ignored, not applied
+		Enabled:     false,
+	})
+	if err != nil {
+		t.Fatalf("second Create (same cron_id): %v", err)
+	}
+	if second.CronID != first.CronID {
+		t.Fatalf("CronID changed: got %q, want %q", second.CronID, first.CronID)
+	}
+	if second.Schedule != first.Schedule {
+		t.Errorf("Schedule changed on conflict: got %q, want %q (original)", second.Schedule, first.Schedule)
+	}
+	if second.Enabled != first.Enabled {
+		t.Errorf("Enabled changed on conflict: got %v, want %v (original)", second.Enabled, first.Enabled)
+	}
+
+	rows, err := store.Search(ctx, crons.SearchInput{}, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	count := 0
+	for _, c := range rows {
+		if c.CronID == first.CronID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("found %d rows with cron_id %s, want exactly 1 (no duplicate)", count, first.CronID)
+	}
+}
+
 func TestCronStore_Patch_UpdatesSchedule(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -178,6 +235,142 @@ func TestCronStore_Patch_UpdatesSchedule(t *testing.T) {
 	}
 	if c.Schedule != "0 * * * *" {
 		t.Errorf("Schedule = %q, want 0 * * * *", c.Schedule)
+	}
+}
+
+// TestCronStore_Patch_ScheduleOnly_PreservesTimezone verifies 4d-iii:
+// patching only Schedule recomputes next_run_date using the row's stored
+// timezone, not UTC.
+func TestCronStore_Patch_ScheduleOnly_PreservesTimezone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-tz-preserve-graph", nil)
+
+	created, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID: aID,
+		Schedule:    "0 12 * * *",
+		Timezone:    "America/New_York",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	patched, err := store.Patch(ctx, created.CronID, crons.PatchCronInput{Schedule: "30 12 * * *"}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Timezone != "America/New_York" {
+		t.Errorf("Timezone = %q, want unchanged America/New_York", patched.Timezone)
+	}
+	if patched.NextRunDate == nil {
+		t.Fatal("NextRunDate is nil")
+	}
+	// 12:30 America/New_York == 16:30 or 17:30 UTC depending on DST; either
+	// way it must NOT be 12:30 UTC (which is what recomputing against
+	// timezone="" would have produced).
+	if patched.NextRunDate.UTC().Hour() == 12 && patched.NextRunDate.UTC().Minute() == 30 {
+		t.Errorf("NextRunDate = %v looks computed against UTC, not the stored America/New_York timezone", patched.NextRunDate)
+	}
+}
+
+// TestCronStore_Patch_TimezoneOnly_Recomputes verifies 4d-iii: patching only
+// Timezone (with no Schedule in the request) still recomputes next_run_date,
+// using the row's stored schedule.
+func TestCronStore_Patch_TimezoneOnly_Recomputes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-tz-only-graph", nil)
+
+	created, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID: aID,
+		Schedule:    "0 12 * * *",
+		Timezone:    "UTC",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.NextRunDate == nil {
+		t.Fatal("NextRunDate is nil after Create")
+	}
+	before := *created.NextRunDate
+
+	patched, err := store.Patch(ctx, created.CronID, crons.PatchCronInput{Timezone: "America/New_York"}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Schedule != "0 12 * * *" {
+		t.Errorf("Schedule changed to %q, want unchanged 0 12 * * *", patched.Schedule)
+	}
+	if patched.Timezone != "America/New_York" {
+		t.Errorf("Timezone = %q, want America/New_York", patched.Timezone)
+	}
+	if patched.NextRunDate == nil {
+		t.Fatal("NextRunDate is nil after Patch")
+	}
+	if patched.NextRunDate.Equal(before) {
+		t.Errorf("NextRunDate unchanged (%v) after patching timezone; recompute did not run", before)
+	}
+}
+
+// TestCronStore_Patch_MergesPayloadAndMetadata verifies 4d-ii: Patch merges
+// payload/metadata JSONB (||) instead of replacing, so unrelated top-level
+// keys from the original row survive a partial patch.
+func TestCronStore_Patch_MergesPayloadAndMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "patch-merge-graph", nil)
+
+	created, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID: aID,
+		Schedule:    "* * * * *",
+		Enabled:     true,
+		Payload:     []byte(`{"assistant_id":"keep-me","input":{"x":1}}`),
+		Metadata:    []byte(`{"owner":"alice","tag":"old"}`),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	patched, err := store.Patch(ctx, created.CronID, crons.PatchCronInput{
+		Payload:  []byte(`{"input":{"x":2}}`),
+		Metadata: []byte(`{"tag":"new"}`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+
+	var payload, metadata map[string]json.RawMessage
+	if err := json.Unmarshal(patched.Payload, &payload); err != nil {
+		t.Fatalf("payload not valid JSON: %v", err)
+	}
+	if err := json.Unmarshal(patched.Metadata, &metadata); err != nil {
+		t.Fatalf("metadata not valid JSON: %v", err)
+	}
+
+	if _, ok := payload["assistant_id"]; !ok {
+		t.Errorf("payload lost top-level key %q after replace-style patch: %s", "assistant_id", patched.Payload)
+	}
+	var input map[string]int
+	if err := json.Unmarshal(payload["input"], &input); err != nil || input["x"] != 2 {
+		t.Errorf("payload.input = %s, want {\"x\":2}", payload["input"])
+	}
+	if _, ok := metadata["owner"]; !ok {
+		t.Errorf("metadata lost top-level key %q after replace-style patch: %s", "owner", patched.Metadata)
+	}
+	var tag string
+	if err := json.Unmarshal(metadata["tag"], &tag); err != nil || tag != "new" {
+		t.Errorf("metadata.tag = %s, want \"new\"", metadata["tag"])
 	}
 }
 
@@ -577,6 +770,115 @@ func TestCronStore_Search_SortOrder(t *testing.T) {
 	if ascOrder[0].CreatedAt.After(ascOrder[1].CreatedAt) {
 		t.Errorf("asc sort: expected created_at ASC; got %v after %v",
 			ascOrder[0].CreatedAt, ascOrder[1].CreatedAt)
+	}
+}
+
+// TestCronStore_Next_AdvancesNextRunDate verifies that Next() itself advances
+// next_run_date atomically (4c) — the caller no longer needs a separate
+// SetNextRunDate call.
+func TestCronStore_Next_AdvancesNextRunDate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "next-advance-graph", nil)
+	cronID := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, cronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	due, err := store.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var claimed *crons.Cron
+	for _, cw := range due {
+		if cw.Cron.CronID == cronID {
+			claimed = cw.Cron
+		}
+	}
+	if claimed == nil {
+		t.Fatal("cron not claimed by Next")
+	}
+
+	var stored time.Time
+	if err := pool.QueryRow(ctx, `SELECT next_run_date FROM cron WHERE cron_id = $1::uuid`, cronID).Scan(&stored); err != nil {
+		t.Fatalf("select next_run_date: %v", err)
+	}
+	if !stored.After(time.Now()) {
+		t.Errorf("next_run_date = %v, want advanced into the future", stored)
+	}
+
+	// A second Next() call must not re-claim the now-future-dated row.
+	due2, err := store.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next (second call): %v", err)
+	}
+	for _, cw := range due2 {
+		if cw.Cron.CronID == cronID {
+			t.Errorf("cron %s re-claimed by a second Next() call after advancing", cronID)
+		}
+	}
+}
+
+// TestCronStore_Next_ConcurrentCallsDoNotDoubleClaim proves that two
+// concurrent Next() calls (simulating two scheduler replicas) never both
+// claim the same due cron — FOR NO KEY UPDATE SKIP LOCKED plus the
+// same-transaction next_run_date advance (4c) is what guarantees this.
+func TestCronStore_Next_ConcurrentCallsDoNotDoubleClaim(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "next-concurrent-graph", nil)
+
+	const n = 10
+	ids := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		id := testdb.MustInsertCronEnabled(t, ctx, pool, aID, "* * * * *", true)
+		if _, err := pool.Exec(ctx,
+			`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, id,
+		); err != nil {
+			t.Fatalf("set next_run_date: %v", err)
+		}
+		ids[id] = struct{}{}
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	claimedBy := make(map[string]int) // cron_id -> number of goroutines that claimed it
+	const replicas = 5
+	for i := 0; i < replicas; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			due, err := store.Next(ctx)
+			if err != nil {
+				t.Errorf("Next: %v", err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, cw := range due {
+				claimedBy[cw.Cron.CronID]++
+			}
+		}()
+	}
+	wg.Wait()
+
+	total := 0
+	for id, count := range claimedBy {
+		if count > 1 {
+			t.Errorf("cron %s claimed by %d concurrent Next() calls, want at most 1", id, count)
+		}
+		total += count
+	}
+	if total != n {
+		t.Errorf("total claims across all replicas = %d, want %d (every due cron claimed exactly once)", total, n)
 	}
 }
 

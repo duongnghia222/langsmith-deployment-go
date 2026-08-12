@@ -8,6 +8,7 @@ import (
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	enumcronorc "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cron_on_run_completed"
+	enummultitaskstrategy "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,6 +37,11 @@ func CronScheduler(ctx context.Context, pool *pgxpool.Pool, store *Store, runsCr
 	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
+	// Fire the first tick immediately instead of waiting a full interval
+	// (time.NewTicker's first tick lands after cfg.Interval elapses).
+	if err := schedulerTick(ctx, pool, store, runsCreator, log, cfg.AdvisoryKey); err != nil {
+		log.Error("cron scheduler: tick", "err", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -73,36 +79,36 @@ func schedulerTick(ctx context.Context, pool *pgxpool.Pool, store *Store, rc Run
 	}
 	for _, cw := range due {
 		c := cw.Cron
-		// Use the DB-side now() snapshot as base for next-run computation,
-		// matching Python cron_scheduler.py:131 (cron["now"]).
-		nextRun, err := computeNextRunFrom(c.Schedule, c.Timezone, cw.Now)
-		if err != nil {
-			log.Error("cron scheduler: compute next run", "cron_id", c.CronID, "err", err)
-			continue
-		}
+		// next_run_date has already been atomically claimed-and-advanced by
+		// store.Next() (see store.go), so the scheduler no longer computes or
+		// persists it itself — that used to happen after the row's lock was
+		// already released, leaving a race window across scheduler replicas.
 
 		// Inject on_completion: "keep" when the cron's on_run_completed is "keep"
 		// (cron_scheduler.py:89-90: run_payload.setdefault("on_completion", "keep")).
 		// Setdefault semantics: caller's existing key wins.
 		payload := injectOnCompletion(c.Payload, c.OnRunCompleted)
 
-		// Fire a synthetic Runs.Create. Omitting MultitaskStrategy gives the
-		// zero enum value (reject) on the server side — cron fires only if thread is idle.
+		ifNotExists := coreapi.CreateRunBehavior_CREATE_THREAD_IF_THREAD_NOT_EXISTS
+		multitaskStrategy := multitaskStrategyFromPayload(payload)
 		req := &coreapi.CreateRunRequest{
-			AssistantId:  &coreapi.UUID{Value: c.AssistantID},
-			KwargsJson:   payload,
-			MetadataJson: c.Metadata,
+			AssistantId: &coreapi.UUID{Value: c.AssistantID},
+			KwargsJson:  payload,
+			// cron_scheduler.py:87-92: {**cron_metadata, **existing_metadata},
+			// payload's own "metadata" key wins over the cron row's metadata.
+			MetadataJson: mergeCronMetadata(c.Metadata, payload),
+			// cron_scheduler.py:96-98: set_auth_ctx_for_run(..., user_id=cron["user_id"]).
+			IfNotExists:       &ifNotExists,
+			MultitaskStrategy: &multitaskStrategy,
 		}
 		if c.ThreadID != "" {
 			req.ThreadId = &coreapi.UUID{Value: c.ThreadID}
 		}
+		if c.UserID != "" {
+			req.UserId = &c.UserID
+		}
 		if _, err := rc.Create(ctx, req); err != nil {
 			log.Error("cron scheduler: create run", "cron_id", c.CronID, "err", err)
-			// Advance next_run_date even on run-creation failure to avoid tight-loop.
-		}
-
-		if err := store.SetNextRunDate(ctx, c.CronID, nextRun); err != nil {
-			log.Error("cron scheduler: set next run date", "cron_id", c.CronID, "err", err)
 		}
 	}
 	return nil
@@ -139,6 +145,52 @@ func injectOnCompletion(payload []byte, onRunCompleted string) []byte {
 	out, err := json.Marshal(m)
 	if err != nil {
 		return payload
+	}
+	return out
+}
+
+// multitaskStrategyFromPayload reads the payload dict's "multitask_strategy"
+// key (crons.py:_payload_dict_to_proto routes it through extra_json verbatim,
+// so it round-trips as a plain string), defaulting to "enqueue" when absent
+// or unrecognised (api/models/run.py:185: payload.get("multitask_strategy")
+// or "enqueue").
+func multitaskStrategyFromPayload(payload []byte) enummultitaskstrategy.MultitaskStrategy {
+	var obj struct {
+		MultitaskStrategy string `json:"multitask_strategy"`
+	}
+	_ = json.Unmarshal(payload, &obj) // leave obj zero-valued on parse error
+	if v, ok := enummultitaskstrategy.MultitaskStrategy_value[obj.MultitaskStrategy]; ok {
+		return enummultitaskstrategy.MultitaskStrategy(v)
+	}
+	return enummultitaskstrategy.MultitaskStrategy_enqueue
+}
+
+// mergeCronMetadata merges the cron row's own metadata with the run payload's
+// "metadata" key, with the payload's keys taking precedence on conflict —
+// cron_scheduler.py:32-49 get_metadata_from_payload: {**cron_metadata, **existing_metadata}.
+func mergeCronMetadata(cronMetadata, payload []byte) []byte {
+	merged := map[string]json.RawMessage{}
+	if len(cronMetadata) > 0 {
+		_ = json.Unmarshal(cronMetadata, &merged)
+	}
+	if merged == nil {
+		merged = map[string]json.RawMessage{}
+	}
+
+	var payloadObj map[string]json.RawMessage
+	_ = json.Unmarshal(payload, &payloadObj)
+	if raw, ok := payloadObj["metadata"]; ok {
+		var payloadMeta map[string]json.RawMessage
+		if json.Unmarshal(raw, &payloadMeta) == nil {
+			for k, v := range payloadMeta {
+				merged[k] = v
+			}
+		}
+	}
+
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return cronMetadata
 	}
 	return out
 }
