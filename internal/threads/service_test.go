@@ -18,6 +18,7 @@ import (
 	"github.com/duongnghia222/langsmith-deployment-go/internal/testdb"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/threads"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
@@ -427,6 +428,49 @@ func TestThreads_Copy_CopiesCheckpoints_Integration(t *testing.T) {
 	}
 	if len(tuple.Blobs) == 0 {
 		t.Error("copied checkpoint has no blobs")
+	}
+}
+
+// ── 3c(ii): atomic thread-row + checkpoint copy ──────────────────────────────
+
+// failingCopier is a CheckpointerCopier whose CopyThreadTx always fails, used
+// to prove Service.Copy rolls back the new thread row when the checkpoint
+// copy fails mid-transaction (3c-ii: ops.py:1084-1131 runs the thread-row
+// insert and all checkpoint inserts as one pipeline).
+type failingCopier struct{}
+
+func (failingCopier) CopyThread(ctx context.Context, fromThreadID, toThreadID string) error {
+	return fmt.Errorf("unexpected: CopyThread called; want CopyThreadTx")
+}
+
+func (failingCopier) CopyThreadTx(ctx context.Context, tx pgx.Tx, fromThreadID, toThreadID string) error {
+	return fmt.Errorf("simulated checkpoint copy failure")
+}
+
+func TestService_Copy_ChecklistFailureRollsBackThreadRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+	svc.WithCheckpointer(failingCopier{})
+
+	srcID := uuid.NewString()
+	testdb.MustInsertThread(t, ctx, pool, srcID, nil)
+
+	_, err := svc.Copy(ctx, &coreapi.CopyThreadRequest{
+		ThreadId: &coreapi.UUID{Value: srcID},
+	})
+	if err == nil {
+		t.Fatal("expected error when checkpoint copy fails")
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM thread`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("thread count = %d, want 1 (new row must be rolled back with the failed checkpoint copy)", count)
 	}
 }
 

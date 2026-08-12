@@ -2,8 +2,10 @@ package threads
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +21,12 @@ var ErrNotFound = errors.New("thread not found")
 
 // ErrForbidden is returned when an auth filter excludes the matching thread row.
 var ErrForbidden = errors.New("thread forbidden by auth filters")
+
+// ErrFailedPrecondition is returned by SetStatus when ExpectedStatus is set
+// and the thread's current status isn't one of the expected values (the
+// busy-guard State.post relies on for optimistic concurrency — ops.py client
+// parity item 3g).
+var ErrFailedPrecondition = errors.New("thread status does not match expected_status")
 
 // Store provides read-only access to the thread table.
 type Store struct {
@@ -126,7 +134,7 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, []any, in
 		args = append(args, in.MetadataFilter)
 		idx++
 	}
-	if len(in.ValuesFilter) > 0 {
+	if len(in.ValuesFilter) > 0 && !isEmptyJSONObject(in.ValuesFilter) {
 		wheres = append(wheres, fmt.Sprintf("\"values\" @> $%d::jsonb", idx))
 		args = append(args, in.ValuesFilter)
 		idx++
@@ -147,6 +155,20 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, []any, in
 		idx += len(authArgs)
 	}
 	return strings.Join(wheres, " AND "), args, idx, nil
+}
+
+// isEmptyJSONObject reports whether raw decodes to a JSON object with no keys.
+// (3a) The Python client used to always send b"{}" for an omitted values
+// filter; NULL @> '{}'::jsonb evaluates to NULL (not TRUE) in Postgres, so an
+// unconditional clause would incorrectly exclude fresh threads whose
+// "values" column is still NULL. The client is fixed to omit the field
+// outright; this is defense-in-depth against the same shape arriving anyway.
+func isEmptyJSONObject(raw []byte) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	return len(m) == 0
 }
 
 // Search returns threads matching the given criteria.
@@ -367,7 +389,8 @@ func (s *Store) Patch(ctx context.Context, threadID string, in PatchThreadInput,
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
-	sets := []string{"updated_at = now()"}
+	// (3d) ops.py:882-885 only ever sets metadata — no updated_at bump.
+	var sets []string
 	args := []any{threadID}
 	idx := 2 + len(authArgs)
 	if len(in.Metadata) > 0 {
@@ -387,6 +410,12 @@ func (s *Store) Patch(ctx context.Context, threadID string, in PatchThreadInput,
 		idx++
 	}
 	_ = idx // suppress unused variable warning after last use
+	if len(sets) == 0 {
+		// Nothing to change (Go's Config/TTL-only patch inputs can reach this
+		// even though ops.py itself always writes metadata) — fall back to a
+		// plain read instead of issuing a SET-less UPDATE.
+		return s.Get(ctx, threadID, filters)
+	}
 	finalArgs := append([]any{threadID}, authArgs...)
 	finalArgs = append(finalArgs, args[1:]...)
 	q := fmt.Sprintf(
@@ -434,27 +463,17 @@ type SetStatusInput struct {
 	StatusText string // "idle" | "interrupted" | "error" — caller pre-computes
 	ValuesJSON []byte // checkpoint["values"]; nil → SQL NULL (ops.py:936: Jsonb(checkpoint["values"]) if checkpoint else None)
 	Interrupts []byte // computed from checkpoint tasks; nil → '{}'
+	// ExpectedStatus (3g), when non-empty, is a busy-guard: the update is
+	// only applied if the thread's current status is one of these values;
+	// otherwise ErrFailedPrecondition is returned and the row is untouched.
+	// Mirrors the optimistic-concurrency check State.post relies on.
+	ExpectedStatus []string
 }
 
-// SetStatus sets the thread status, values, and interrupts following Python
-// ops.py:916-944. The CASE WHEN EXISTS busy check mirrors Python exactly:
-// if there are pending/running runs the final status is 'busy' and
-// returns true (caller can then wake a worker — ops.py:940-944).
-//
-// Returns (busy bool, error).
-func (s *Store) SetStatus(ctx context.Context, in SetStatusInput) (busy bool, err error) {
-	interrupts := in.Interrupts
-	if interrupts == nil {
-		interrupts = []byte(`{}`)
-	}
-	// (C11) ops.py:916-931: UPDATE thread SET updated_at, values, interrupts, status=CASE...
-	// values arg: nil → pass NULL (ops.py:936: None when checkpoint is None).
-	var valuesArg any
-	if in.ValuesJSON != nil {
-		valuesArg = in.ValuesJSON
-	}
-	var finalStatus string
-	row := s.pool.QueryRow(ctx, `
+// setStatusSQL is the thread-only status/values/interrupts update, shared by
+// the plain and expected_status-guarded paths of SetStatus.
+// (C11) ops.py:916-931: UPDATE thread SET updated_at, values, interrupts, status=CASE...
+const setStatusSQL = `
 UPDATE thread SET
     updated_at  = now(),
     "values"    = $1::jsonb,
@@ -468,12 +487,68 @@ UPDATE thread SET
         ELSE $4
     END
 WHERE thread_id = $3::uuid
-RETURNING status`,
-		valuesArg, interrupts, in.ThreadID, in.StatusText,
-	)
-	if scanErr := row.Scan(&finalStatus); scanErr != nil {
-		// Thread not found is a no-op (internal call — no auth).
-		return false, nil
+RETURNING status`
+
+// SetStatus sets the thread status, values, and interrupts following Python
+// ops.py:916-944. The CASE WHEN EXISTS busy check mirrors Python exactly:
+// if there are pending/running runs the final status is 'busy' and
+// returns true (caller can then wake a worker — ops.py:940-944).
+//
+// Returns (busy bool, error). A real DB error is returned as-is (3e); only
+// pgx.ErrNoRows (thread not found) is treated as a no-op, matching this
+// internal (no-auth) call's existing semantics.
+func (s *Store) SetStatus(ctx context.Context, in SetStatusInput) (busy bool, err error) {
+	interrupts := in.Interrupts
+	if interrupts == nil {
+		interrupts = []byte(`{}`)
+	}
+	// values arg: nil → pass NULL (ops.py:936: None when checkpoint is None).
+	var valuesArg any
+	if in.ValuesJSON != nil {
+		valuesArg = in.ValuesJSON
+	}
+
+	if len(in.ExpectedStatus) == 0 {
+		var finalStatus string
+		row := s.pool.QueryRow(ctx, setStatusSQL, valuesArg, interrupts, in.ThreadID, in.StatusText)
+		if scanErr := row.Scan(&finalStatus); scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				return false, nil
+			}
+			return false, scanErr
+		}
+		return finalStatus == "busy", nil
+	}
+
+	// (3g) Lock the row and verify its current status before applying the
+	// update, atomically, so a concurrent status change can't race between
+	// the check and the write.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var currentStatus string
+	if lockErr := tx.QueryRow(ctx, `SELECT status FROM thread WHERE thread_id = $1::uuid FOR UPDATE`, in.ThreadID).Scan(&currentStatus); lockErr != nil {
+		if errors.Is(lockErr, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, lockErr
+	}
+	if !slices.Contains(in.ExpectedStatus, currentStatus) {
+		return false, ErrFailedPrecondition
+	}
+
+	var finalStatus string
+	if scanErr := tx.QueryRow(ctx, setStatusSQL, valuesArg, interrupts, in.ThreadID, in.StatusText).Scan(&finalStatus); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, scanErr
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
 	}
 	return finalStatus == "busy", nil
 }
@@ -547,7 +622,13 @@ func (s *Store) SetJointStatus(ctx context.Context, in SetJointStatusInput) erro
 		valuesArg = in.ValuesJSON
 	}
 
-	graphMeta := []byte(fmt.Sprintf(`{"graph_id":%q}`, in.GraphID))
+	// (3f) fmt.Sprintf %q is Go quoting, not JSON — breaks on graph IDs
+	// containing characters like backslashes that Go and JSON escape
+	// differently. json.Marshal produces valid JSON unconditionally.
+	graphMeta, err := json.Marshal(map[string]string{"graph_id": in.GraphID})
+	if err != nil {
+		return fmt.Errorf("marshal graph_id: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx,
 		`UPDATE thread SET
@@ -571,27 +652,43 @@ func (s *Store) SetJointStatus(ctx context.Context, in SetJointStatusInput) erro
 	return tx.Commit(ctx)
 }
 
-// Copy inserts a new thread row that is a row-only clone of the source thread
-// (same metadata/config/values/status; new UUID, new created_at/updated_at).
-// Checkpoint tables are NOT copied — see TODO(R5) below.
-//
-// TODO(R5): copy checkpoints, checkpoint_blobs, checkpoint_writes via internal/checkpointer
-// after the Checkpointer service is implemented in R5.
+// rowQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, letting Copy's
+// SQL run either standalone or inside a caller-managed transaction (3c-ii).
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Copy inserts a new thread row cloning only the source thread's (thread_id,
+// metadata) — ops.py:1087-1089. Every other column takes its schema default
+// (status='idle', config='{}', values=NULL, interrupts='{}'), matching Python
+// exactly; the new row does not inherit the source thread's status/config/values.
 func (s *Store) Copy(ctx context.Context, srcThreadID string, filters []*coreapi.AuthFilter) (*Thread, error) {
+	return copyRow(ctx, s.pool, srcThreadID, filters)
+}
+
+// CopyTx is Copy run against a caller-managed transaction. Threads.Service.Copy
+// (3c-ii) shares one tx across this and checkpointer.Store.CopyThreadTx so a
+// checkpoint-copy failure rolls back the new thread row too — ops.py:1084-1131
+// runs the thread-row insert and all 3 checkpoint inserts in a single pipeline.
+func (s *Store) CopyTx(ctx context.Context, tx pgx.Tx, srcThreadID string, filters []*coreapi.AuthFilter) (*Thread, error) {
+	return copyRow(ctx, tx, srcThreadID, filters)
+}
+
+func copyRow(ctx context.Context, q rowQuerier, srcThreadID string, filters []*coreapi.AuthFilter) (*Thread, error) {
 	authSQL, args, err := auth.ApplyToQuery(filters, "metadata", 2)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
-	q := fmt.Sprintf(`
-		INSERT INTO thread (thread_id, metadata, config, "values", interrupts, status, created_at, updated_at)
-		SELECT gen_random_uuid(), metadata, config, "values", interrupts, status, now(), now()
+	sql := fmt.Sprintf(`
+		INSERT INTO thread (thread_id, metadata)
+		SELECT gen_random_uuid(), metadata
 		FROM thread WHERE thread_id = $1::uuid%s
 		RETURNING %s`,
 		prefixWithAnd(authSQL),
 		threadCols,
 	)
 	var t Thread
-	row := s.pool.QueryRow(ctx, q, append([]any{srcThreadID}, args...)...)
+	row := q.QueryRow(ctx, sql, append([]any{srcThreadID}, args...)...)
 	if err := row.Scan(&t.ThreadID, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.ExpiresAt, &t.StateUpdatedAt, &t.Metadata, &t.Config, &t.Values, &t.Interrupts); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -641,4 +738,3 @@ func (s *Store) ThreadExistsAndAuth(ctx context.Context, threadID string, filter
 	}
 	return nil
 }
-

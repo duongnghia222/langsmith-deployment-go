@@ -14,6 +14,7 @@ import (
 	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	lsdstream "github.com/duongnghia222/langsmith-deployment-go/internal/stream"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
@@ -26,6 +27,10 @@ import (
 // Threads.Copy. Defined as a local interface for testability (D6).
 type CheckpointerCopier interface {
 	CopyThread(ctx context.Context, fromThreadID, toThreadID string) error
+	// CopyThreadTx is CopyThread run against a caller-managed transaction
+	// (3c-ii), so Service.Copy can share one tx across the thread-row copy
+	// and the checkpoint copy.
+	CopyThreadTx(ctx context.Context, tx pgx.Tx, fromThreadID, toThreadID string) error
 }
 
 // Service is a gRPC adapter that implements coreapi.ThreadsServer.
@@ -219,6 +224,10 @@ func mapErr(err error) error {
 	if errors.Is(err, ErrForbidden) {
 		return status.Error(codes.NotFound, err.Error())
 	}
+	// (3g) expected_status busy-guard mismatch — client maps this to HTTP 409.
+	if errors.Is(err, ErrFailedPrecondition) {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
 	return status.Error(codes.Internal, err.Error())
 }
 
@@ -318,11 +327,19 @@ func (s *Service) SetStatus(ctx context.Context, req *coreapi.SetThreadStatusReq
 			interruptsJSON = cp.GetInterruptsJson()
 		}
 	}
+	// (3g) expected_status busy-guard — ops.py has no equivalent; this backs
+	// State.post's optimistic-concurrency check (client sends the thread's
+	// pre-fetch status and expects FailedPrecondition on a mismatch).
+	var expectedStatus []string
+	for _, e := range req.GetExpectedStatus() {
+		expectedStatus = append(expectedStatus, thStatusEnumToText(e))
+	}
 	busy, err := s.store.SetStatus(ctx, SetStatusInput{
-		ThreadID:   req.GetThreadId().GetValue(),
-		StatusText: statusText,
-		ValuesJSON: valuesJSON,
-		Interrupts: interruptsJSON,
+		ThreadID:       req.GetThreadId().GetValue(),
+		StatusText:     statusText,
+		ValuesJSON:     valuesJSON,
+		Interrupts:     interruptsJSON,
+		ExpectedStatus: expectedStatus,
 	})
 	if err != nil {
 		return nil, mapErr(err)
@@ -361,15 +378,35 @@ func (s *Service) SetJointStatus(ctx context.Context, req *coreapi.SetThreadJoin
 // Copy implements ThreadsServer.Copy.
 // Copies the thread row, then delegates checkpoint copy to the wired
 // CheckpointerCopier (D6). If no copier is wired, only the row is copied.
+//
+// (3c-ii) When a copier is wired, the thread-row copy and the checkpoint
+// copy run inside one transaction so a checkpoint-copy failure rolls back
+// the new thread row too — ops.py:1084-1131 runs all 4 inserts in a single
+// pipeline (both stores share the same pgx pool).
 func (s *Service) Copy(ctx context.Context, req *coreapi.CopyThreadRequest) (*coreapi.Thread, error) {
-	th, err := s.store.Copy(ctx, req.GetThreadId().GetValue(), req.GetFilters())
+	if s.checkpointer == nil {
+		th, err := s.store.Copy(ctx, req.GetThreadId().GetValue(), req.GetFilters())
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		return toPB(th), nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "begin copy tx: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	th, err := s.store.CopyTx(ctx, tx, req.GetThreadId().GetValue(), req.GetFilters())
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	if s.checkpointer != nil {
-		if err := s.checkpointer.CopyThread(ctx, req.GetThreadId().GetValue(), th.ThreadID); err != nil {
-			return nil, status.Errorf(codes.Internal, "copy checkpoints: %v", err)
-		}
+	if err := s.checkpointer.CopyThreadTx(ctx, tx, req.GetThreadId().GetValue(), th.ThreadID); err != nil {
+		return nil, status.Errorf(codes.Internal, "copy checkpoints: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "commit copy: %v", err)
 	}
 	return toPB(th), nil
 }
@@ -484,4 +521,3 @@ func threadsSortByToColumn(sb coreapi.ThreadsSortBy) string {
 		return "" // falls back to "created_at DESC" in sortClause
 	}
 }
-

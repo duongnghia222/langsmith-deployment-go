@@ -95,6 +95,7 @@ func main() {
 		Interval: cfg.ReaperInterval,
 	})
 	go crons.CronScheduler(ctx, pool, crons.NewStore(pool), runsSvc, log, crons.SchedulerConfig{})
+	go threads.TTLSweeper(ctx, pool, log, threads.TTLSweeperConfig{Interval: cfg.ThreadTTLSweepInterval})
 
 	go func() {
 		log.Info("grpc serving", "addr", cfg.GRPCAddr)
