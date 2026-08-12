@@ -1662,6 +1662,138 @@ func TestStream_HonorsStreamModes(t *testing.T) {
 	}
 }
 
+// TestStream_JoinWithoutLastEventID_NoHistoryReplay is the plan-mandated
+// regression test for (2i), and a fix-round-1 regression test for finding 2:
+// publish 3 events, then subscribe+join WITHOUT last_event_id, then publish
+// more events afterward — only the events published AFTER Join must arrive.
+// The 3 pre-existing events are written and confirmed BEFORE Join is even
+// sent, so if Join's initial cursor were resolved by handing the literal "$"
+// sentinel into a repeatedly re-armed blocking XREAD (the old, buggy
+// behavior), the fix under test — resolving the tail to a concrete ID ONCE
+// via Streamer.LastID before the buffer goroutine starts — is what this test
+// pins down: it proves no history leaks through and (by construction, since
+// the post-join event is appended only after a real network round trip) no
+// entry is skipped either.
+func TestStream_JoinWithoutLastEventID_NoHistoryReplay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+
+	assistantID := testdb.MustInsertAssistant(t, ctx, pool, "stream-no-replay", nil)
+	threadID := "ffffffff-0000-0000-0000-ffffffffffff"
+	testdb.MustInsertThread(t, ctx, pool, threadID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, threadID, assistantID, "running")
+	runUUID := uuid.MustParse(runID)
+
+	cfg := &config.Config{
+		StreamMaxLen:      1000,
+		StreamReadBlockMs: 500,
+		StreamReplayBatch: 100,
+	}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	// Pre-existing history: 3 events written and confirmed BEFORE Join is
+	// ever sent (Subscribe below has not even happened yet).
+	for _, seq := range []string{`{"seq":1}`, `{"seq":2}`, `{"seq":3}`} {
+		if _, err := streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "updates",
+			"message":    seq,
+		}, 1000); err != nil {
+			t.Fatalf("XAdd pre-join entry: %v", err)
+		}
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go srv.Serve(lis) //nolint:errcheck
+	t.Cleanup(func() { srv.GracefulStop() })
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer streamCancel()
+
+	bidiStream, err := coreapi.NewRunsClient(conn).Stream(streamCtx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Subscribe{
+			Subscribe: &coreapi.SubscribeRunRequest{
+				RunId:    &coreapi.UUID{Value: runID},
+				ThreadId: &coreapi.UUID{Value: threadID},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Subscribe: %v", err)
+	}
+	if _, err := bidiStream.Recv(); err != nil {
+		t.Fatalf("Recv subscribed: %v", err)
+	}
+
+	// Join with no last_event_id: must NOT replay the 3 pre-existing events.
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Join{
+			Join: &coreapi.JoinRunRequest{},
+		},
+	}); err != nil {
+		t.Fatalf("Send Join: %v", err)
+	}
+
+	// Side goroutine: publish one new event after Join, then terminal.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "updates",
+			"message":    `{"seq":4}`,
+		}, 1000)
+		time.Sleep(300 * time.Millisecond)
+		_ = streamer.Publish(ctx, lsdstream.RunTerminalChannel(runUUID), []byte("done"))
+	}()
+
+	var receivedMessages []string
+	for {
+		ev, err := bidiStream.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if ev.GetEventType() == "control" && string(ev.GetMessage()) == "done" {
+			break
+		}
+		receivedMessages = append(receivedMessages, string(ev.GetMessage()))
+	}
+
+	if len(receivedMessages) != 1 {
+		t.Fatalf("received %d events, want 1 (only post-join); messages: %v", len(receivedMessages), receivedMessages)
+	}
+	if receivedMessages[0] != `{"seq":4}` {
+		t.Errorf("received message = %q, want post-join seq 4 (pre-existing history must not replay)", receivedMessages[0])
+	}
+}
+
 // ─── Parity gap tests (C6, C7, C8, C9) ──────────────────────────────────────
 
 // TestCancel_PublishesControlSignal verifies C6 parity:
@@ -1731,6 +1863,78 @@ func TestCancel_PublishesControlSignal(t *testing.T) {
 	ttl := rdb.TTL(ctx, controlCh).Val()
 	if ttl <= 0 || ttl > 60*time.Second {
 		t.Errorf("control key TTL = %v, want (0, 60s]", ttl)
+	}
+}
+
+// TestCancel_PublishesSignalForMatchedRun_EvenWhenBatchHasUnmatchedID is a
+// fix-round-1 regression test (finding 1): a mixed Cancel run_ids batch — one
+// live/matched run plus one bogus/already-terminal ID — must still publish
+// the control signal for the matched run before the NotFound shortfall check
+// runs, exactly like ops.py (ops.py:1834-1837 SETs+PUBLISHes for every
+// requested run_id before the SQL runs; the raise at ops.py:1907 only aborts
+// the caller's transaction, not the signal that already went out). The
+// service must not silently swallow a live run's signal just because a
+// sibling ID in the same request was bogus.
+func TestCancel_PublishesSignalForMatchedRun_EvenWhenBatchHasUnmatchedID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	rdb := startRedis(t, ctx)
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "cancel-mixed-batch", nil)
+	thID := "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	runningID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+	terminalID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "success")
+
+	streamer := lsdstream.NewStreamer(rdb)
+	cfg := &config.Config{StreamMaxLen: 1000}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	runUUID := uuid.MustParse(runningID)
+	controlCh := lsdstream.RunControlChannel(runUUID)
+
+	// Subscribe to the matched (still-live) run's control channel BEFORE
+	// calling Cancel so we catch the PUBLISH even though the overall call
+	// will fail with NotFound because of the sibling bogus/terminal ID.
+	sub := rdb.Subscribe(ctx, controlCh)
+	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		t.Fatalf("Subscribe receive: %v", err)
+	}
+	msgCh := sub.Channel()
+
+	_, err = svc.Cancel(ctx, &coreapi.CancelRunRequest{
+		Target: &coreapi.CancelRunRequest_RunIds{
+			RunIds: &coreapi.CancelRunIdsTarget{
+				RunIds: []*coreapi.UUID{{Value: runningID}, {Value: terminalID}},
+			},
+		},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("err code = %s, want NotFound", status.Code(err))
+	}
+
+	// The live run must still have been signalled despite the overall NotFound.
+	select {
+	case msg := <-msgCh:
+		if msg.Payload == "" {
+			t.Error("received empty payload on control channel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control channel message; matched run was not signalled before the NotFound shortfall check")
 	}
 }
 

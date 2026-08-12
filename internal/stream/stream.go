@@ -43,6 +43,24 @@ func (s *Streamer) XAdd(ctx context.Context, key string, fields map[string]any, 
 	return id, nil
 }
 
+// LastID returns the ID of the most recently added entry in the stream at
+// key, or "0-0" if the stream is empty or does not exist yet. Callers should
+// resolve this ONCE and use the concrete ID as a starting cursor, rather than
+// passing the "$" sentinel to a blocking XReadFrom call repeatedly: Redis
+// resolves "$" to "the current last ID" at command-processing time on every
+// call, so entries appended between one blocking read returning and the next
+// being issued are silently skipped.
+func (s *Streamer) LastID(ctx context.Context, key string) (string, error) {
+	entries, err := s.rdb.XRevRangeN(ctx, key, "+", "-", 1).Result()
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		return "0-0", nil
+	}
+	return entries[0].ID, nil
+}
+
 // XReadFrom reads up to count entries from the stream at key, starting
 // exclusively from fromID. Use "0-0" to read from the beginning.
 // Use "$" to read only new entries (in blocking mode).
@@ -52,10 +70,18 @@ func (s *Streamer) XAdd(ctx context.Context, key string, fields map[string]any, 
 //
 // Returns an empty slice (not an error) when the timeout expires with no data.
 func (s *Streamer) XReadFrom(ctx context.Context, key, fromID string, count int64, blockMillis int) ([]Entry, error) {
+	// go-redis only omits the BLOCK argument (true non-blocking XREAD) when
+	// Block is negative; Block: 0 still sends "BLOCK 0" to Redis, which means
+	// "block forever," not "don't block." blockMillis<=0 must map to -1 here
+	// to honor this function's documented "0 means non-blocking" contract.
+	block := time.Duration(blockMillis) * time.Millisecond
+	if blockMillis <= 0 {
+		block = -1
+	}
 	args := &goredis.XReadArgs{
 		Streams: []string{key, fromID},
 		Count:   count,
-		Block:   time.Duration(blockMillis) * time.Millisecond,
+		Block:   block,
 	}
 	results, err := s.rdb.XRead(ctx, args).Result()
 	if err != nil {

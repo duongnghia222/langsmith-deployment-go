@@ -301,6 +301,12 @@ func (s *Service) Cancel(ctx context.Context, req *coreapi.CancelRunRequest) (*e
 		if err != nil {
 			return nil, mapErr(err)
 		}
+		// Signal every matched run before checking for a shortfall (ops.py:1834-1837
+		// publishes for all requested run_ids ahead of the raise at ops.py:1907) —
+		// a run that was actually cancelled must not be left unsignalled just
+		// because a sibling ID in the same request was bogus/already-terminal.
+		s.publishCancelSignals(ctx, results, action)
+		s.publishCancelTerminals(ctx, results) // (2f-ii)
 		// (2f-i) NotFound unless every requested run_id matched a pending/running row.
 		matched := make(map[string]bool, len(results))
 		for _, r := range results {
@@ -311,8 +317,6 @@ func (s *Service) Cancel(ctx context.Context, req *coreapi.CancelRunRequest) (*e
 				return nil, status.Error(codes.NotFound, "run not found: "+id)
 			}
 		}
-		s.publishCancelSignals(ctx, results, action)
-		s.publishCancelTerminals(ctx, results) // (2f-ii)
 		return &emptypb.Empty{}, nil
 	}
 	if target := req.GetStatus(); target != nil {
@@ -781,12 +785,24 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 	}
 
 	// (2i) No history replay by default: tail from the stream's current end
-	// ("$", supported directly by XReadFrom) unless the client supplied
-	// last_event_id to resume from. This must be computed here, after
-	// last_event_id is known from the JoinRunRequest, not before.
+	// unless the client supplied last_event_id to resume from. This must be
+	// computed here, after last_event_id is known from the JoinRunRequest,
+	// not before.
+	//
+	// Resolve the tail to a concrete ID ONCE rather than passing the "$"
+	// sentinel into the blocking read loop below: Redis resolves "$" to "the
+	// stream's current last ID" at command-processing time on every XREAD
+	// call, so a client that re-issues "$" on each blocking-timeout re-arm
+	// can silently miss entries appended in the gap between one call
+	// returning and the next being processed. Falling back to "0-0" (full
+	// replay) on error is the safe direction — over-delivery, never a gap.
 	cursor := lastEventID
 	if cursor == "" {
-		cursor = "$"
+		var err error
+		cursor, err = s.streamer.LastID(ctx, lsdstream.RunStreamKey(runUUID))
+		if err != nil {
+			cursor = "0-0"
+		}
 	}
 
 	replayBatch := int64(100)
