@@ -418,6 +418,50 @@ func TestStore_Delete_ThreadsFlag(t *testing.T) {
 	}
 }
 
+// TestStore_Delete_ThreadsFlag_AuthFiltersScopeSweep verifies fix round 1
+// finding 4: the delete_threads sweep must apply the same auth filter used
+// to authorize the assistant delete, not delete threads unconditionally.
+// A thread tagged with this assistant_id but whose own metadata doesn't
+// satisfy the filter (foreign owner) must survive even though
+// delete_threads=true and the assistant delete itself succeeded.
+func TestStore_Delete_ThreadsFlag_AuthFiltersScopeSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads-auth", []byte(`{"owner":"alice"}`))
+	// Foreign-owned thread: tagged with this assistant_id, but its own
+	// metadata doesn't satisfy the "owner":"alice" filter below.
+	foreignThreadID := testdb.MustInsertThreadWithMeta(
+		t, ctx, pool, []byte(`{"assistant_id":"`+aID+`","owner":"bob"}`),
+	)
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+
+	deleted, err := store.Delete(ctx, aID, true, filters)
+	if err != nil {
+		t.Fatalf("Delete with delete_threads + auth filters: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != aID {
+		t.Fatalf("deleted IDs = %v, want [%s] (assistant itself matches the filter)", deleted, aID)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM thread WHERE thread_id = $1::uuid)`, foreignThreadID,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check thread existence: %v", err)
+	}
+	if !exists {
+		t.Errorf("foreign-owned thread %s was deleted; delete_threads must scope the sweep to the "+
+			"same auth filter used for the assistant delete", foreignThreadID)
+	}
+}
+
 func TestStore_SetLatest_RollsBackVersion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")

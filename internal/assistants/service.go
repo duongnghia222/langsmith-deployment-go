@@ -204,16 +204,37 @@ func decodeConfig(raw []byte) (*engcommon.EngineRunnableConfig, bool) {
 	return cfg, true
 }
 
+// legacyOnlyConfigKeys are EngineRunnableConfig protojson field names
+// (UseProtoNames) that config.py's config_from_proto never places at the
+// top level of a Python config dict — it either nests them under
+// "configurable"/"metadata" (e.g. extra_configurable_json's entries land in
+// configurable, graph_id/thread_id/etc. are configurable-only) or doesn't
+// port them at all (runtime, resume_map). A row carrying any of these keys
+// at the top level must be a pre-5f protojson-shaped row.
+//
+// tags/run_name/max_concurrency/recursion_limit/run_id are deliberately
+// excluded: config_from_proto also uses those exact names for legitimate
+// top-level dict keys (config.py:59-70, KNOWN_CONFIG_KEYS), so they can't
+// disambiguate the shape.
+var legacyOnlyConfigKeys = map[string]bool{
+	"metadata_json": true, "extra_json": true, "extra_configurable_json": true,
+	"runtime": true, "resuming": true, "task_id": true, "thread_id": true,
+	"checkpoint_map": true, "checkpoint_id": true, "checkpoint_ns": true,
+	"durability": true, "resume_map": true, "graph_id": true,
+	"root_stream_modes": true, "run_attempt": true, "server_run_id": true,
+	"tracing_project": true, "tracing_example_id": true,
+}
+
 // isLegacyConfigShape reports whether raw stored config JSON is protojson
 // EngineRunnableConfig-shaped (pre-5f) rather than the Python-dict shape
-// written by crons.ConfigProtoToDict. metadata_json/extra_json are proto
-// field names (protojson UseProtoNames) a Python config dict would never
-// carry at the top level — Python nests run_attempt/run_id under "metadata"
-// and flattens extra_json's contents directly onto the dict instead.
+// written by crons.ConfigProtoToDict.
 func isLegacyConfigShape(m map[string]json.RawMessage) bool {
-	_, hasMetadataJSON := m["metadata_json"]
-	_, hasExtraJSON := m["extra_json"]
-	return hasMetadataJSON || hasExtraJSON
+	for k := range m {
+		if legacyOnlyConfigKeys[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // Create implements AssistantsServer.Create.

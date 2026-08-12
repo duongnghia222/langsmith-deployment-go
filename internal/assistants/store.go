@@ -721,7 +721,18 @@ func (s *Store) Delete(ctx context.Context, assistantID string, deleteThreads bo
 	}
 
 	if deleteThreads && len(ids) > 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM thread WHERE metadata->>'assistant_id' = $1::text`, assistantID); err != nil {
+		// Reuse the same auth-filter fragment/args used for the assistant
+		// DELETE above (controller ruling, overriding the brief's unfiltered
+		// SQL): internal/threads/store.go:440-446 gates its own thread
+		// deletes on auth filters too, and applying no filter here would let
+		// delete_threads sweep threads regardless of ownership. Nil-filter
+		// callers are unchanged; filtered callers only sweep threads they
+		// can see.
+		tq := fmt.Sprintf(
+			`DELETE FROM thread WHERE metadata->>'assistant_id' = $1::text%s`,
+			prefixWithAnd(authSQL),
+		)
+		if _, err := tx.Exec(ctx, tq, append([]any{assistantID}, args...)...); err != nil {
 			return nil, err
 		}
 	}
