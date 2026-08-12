@@ -223,6 +223,86 @@ func TestCronStore_Create_Idempotent(t *testing.T) {
 	}
 }
 
+// TestCronStore_Create_EncryptionContextRoundTrips is fix round 1, finding 2:
+// encryption_context must be persisted on create and readable back via Next
+// (which shares cronCols/scanCronWithNow with Create's own RETURNING), not
+// silently dropped.
+func TestCronStore_Create_EncryptionContextRoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+
+	c, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID:       aID,
+		Schedule:          "*/5 * * * *",
+		Enabled:           true,
+		EncryptionContext: []byte(`{"model":"cron"}`),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(c.EncryptionContext) == 0 {
+		t.Fatal("Create: EncryptionContext not returned, want persisted bytes")
+	}
+
+	// next_run_date is computed from the schedule on create; force it into
+	// the past so Next() claims it.
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, c.CronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	due, err := store.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var got *crons.Cron
+	for _, cw := range due {
+		if cw.Cron.CronID == c.CronID {
+			got = cw.Cron
+		}
+	}
+	if got == nil {
+		t.Fatalf("cron %s not returned by Next", c.CronID)
+	}
+	var ec map[string]any
+	if err := json.Unmarshal(got.EncryptionContext, &ec); err != nil {
+		t.Fatalf("unmarshal EncryptionContext: %v", err)
+	}
+	if ec["model"] != "cron" {
+		t.Errorf("EncryptionContext.model = %v, want cron", ec["model"])
+	}
+}
+
+// TestCronStore_Create_EncryptionContextAbsentStaysNil: a cron created without
+// an encryption context must read back with the column genuinely NULL (nil
+// bytes), not "{}" — service.Next relies on nil to leave the proto field
+// unset, matching finding 1's None-vs-empty-dict distinction on the Python side.
+func TestCronStore_Create_EncryptionContextAbsentStaysNil(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+
+	c, err := store.Create(ctx, crons.CreateCronInput{
+		AssistantID: aID,
+		Schedule:    "*/5 * * * *",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if c.EncryptionContext != nil {
+		t.Errorf("EncryptionContext = %q, want nil (column NULL)", c.EncryptionContext)
+	}
+}
+
 func TestCronStore_Patch_UpdatesSchedule(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")

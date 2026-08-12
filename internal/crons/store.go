@@ -34,20 +34,21 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 // Cron is the internal representation of a cron row.
 type Cron struct {
-	CronID         string
-	ThreadID       string // empty string when NULL
-	UserID         string // empty string when NULL
-	AssistantID    string
-	Schedule       string
-	NextRunDate    *time.Time // nullable
-	EndTime        *time.Time // nullable
-	Payload        []byte
-	Metadata       []byte
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	Enabled        bool
-	Timezone       string
-	OnRunCompleted string // empty string = NULL; otherwise an enum name
+	CronID            string
+	ThreadID          string // empty string when NULL
+	UserID            string // empty string when NULL
+	AssistantID       string
+	Schedule          string
+	NextRunDate       *time.Time // nullable
+	EndTime           *time.Time // nullable
+	Payload           []byte
+	Metadata          []byte
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Enabled           bool
+	Timezone          string
+	OnRunCompleted    string // empty string = NULL; otherwise an enum name
+	EncryptionContext []byte // NULL when no context was recorded at create time (fix round 1, finding 2)
 }
 
 // cronCols is the SELECT projection for all Cron fields (unqualified, for single-table queries).
@@ -64,7 +65,8 @@ const cronCols = `cron_id::text,
 	updated_at,
 	COALESCE(enabled, TRUE),
 	COALESCE(timezone, ''),
-	COALESCE(on_run_completed, '')`
+	COALESCE(on_run_completed, ''),
+	encryption_context::text::bytea`
 
 // cronColsAliased returns the SELECT projection for all Cron fields.
 // When aliased is true (i.e. a JOIN is in play), all columns are qualified with "c."
@@ -86,7 +88,8 @@ func cronColsAliased(aliased bool) string {
 	c.updated_at,
 	COALESCE(c.enabled, TRUE),
 	COALESCE(c.timezone, ''),
-	COALESCE(c.on_run_completed, '')`
+	COALESCE(c.on_run_completed, ''),
+	c.encryption_context::text::bytea`
 }
 
 // SearchInput carries the optional filter parameters for Search and Count.
@@ -285,6 +288,7 @@ func scanCron(row pgx.Row, c *Cron) error {
 		&c.Enabled,
 		&c.Timezone,
 		&c.OnRunCompleted,
+		&c.EncryptionContext,
 	)
 }
 
@@ -298,20 +302,21 @@ func prefixWithAnd(frag string) string {
 
 // CreateCronInput carries the fields for a new cron row.
 type CreateCronInput struct {
-	CronID           string // optional; empty → app-generated newUUID() (4e: resolved before INSERT so ON CONFLICT/UNION ALL fallback target the same row)
-	AssistantID      string
-	ThreadID         string // optional
-	UserID           string // optional
-	Schedule         string
-	Timezone         string
-	Enabled          bool
-	EndTime          *time.Time
-	Payload          []byte
-	Metadata         []byte
-	OnRunCompleted   string                // optional; empty → NULL
-	Filters          []*coreapi.AuthFilter // cron-scoped auth filters (applied to cron.metadata in conflict SELECT)
-	AssistantFilters []*coreapi.AuthFilter // auth filters applied to assistant.metadata (ops.py:2185)
-	ThreadFilters    []*coreapi.AuthFilter // auth filters applied to thread.metadata   (ops.py:2210)
+	CronID            string // optional; empty → app-generated newUUID() (4e: resolved before INSERT so ON CONFLICT/UNION ALL fallback target the same row)
+	AssistantID       string
+	ThreadID          string // optional
+	UserID            string // optional
+	Schedule          string
+	Timezone          string
+	Enabled           bool
+	EndTime           *time.Time
+	Payload           []byte
+	Metadata          []byte
+	OnRunCompleted    string                // optional; empty → NULL
+	EncryptionContext []byte                // optional; nil → column stays NULL (fix round 1, finding 2)
+	Filters           []*coreapi.AuthFilter // cron-scoped auth filters (applied to cron.metadata in conflict SELECT)
+	AssistantFilters  []*coreapi.AuthFilter // auth filters applied to assistant.metadata (ops.py:2185)
+	ThreadFilters     []*coreapi.AuthFilter // auth filters applied to thread.metadata   (ops.py:2210)
 }
 
 // Create inserts a new cron row, or returns the pre-existing row when
@@ -382,6 +387,13 @@ func (s *Store) Create(ctx context.Context, in CreateCronInput) (*Cron, error) {
 		orcSQL = fmt.Sprintf("$%d", len(args))
 	} else {
 		orcSQL = "NULL"
+	}
+	var encCtxSQL string
+	if in.EncryptionContext != nil {
+		args = append(args, in.EncryptionContext)
+		encCtxSQL = fmt.Sprintf("$%d::jsonb", len(args))
+	} else {
+		encCtxSQL = "NULL"
 	}
 
 	// ── Auth CTE construction (ops.py:2182-2260) ──────────────────────────
@@ -505,9 +517,10 @@ func (s *Store) Create(ctx context.Context, in CreateCronInput) (*Cron, error) {
 	q := fmt.Sprintf(`%sinserted_cron AS (
     INSERT INTO cron
         (cron_id, assistant_id, thread_id, user_id, schedule, timezone, enabled,
-         next_run_date, end_time, payload, metadata, on_run_completed, created_at, updated_at)
+         next_run_date, end_time, payload, metadata, on_run_completed, encryption_context,
+         created_at, updated_at)
     SELECT
-        %s, %s, %s, %s, $%d, $%d, $%d, $%d, %s, $%d::jsonb, $%d::jsonb, %s, now(), now()
+        %s, %s, %s, %s, $%d, $%d, $%d, $%d, %s, $%d::jsonb, $%d::jsonb, %s, %s, now(), now()
     %s
     ON CONFLICT (cron_id) DO NOTHING
     RETURNING %s
@@ -521,14 +534,15 @@ LIMIT 1`,
 		insertAssistantSelect, // CTE col or literal $N::uuid
 		insertThreadSelect,    // CTE col or "NULL" or "$N::uuid"
 		userSQL,
-		base+1, // schedule
-		base+2, // timezone
-		base+3, // enabled
-		base+4, // next_run_date
-		endSQL, // end_time
-		base+5, // payload
-		base+6, // metadata
-		orcSQL, // on_run_completed
+		base+1,    // schedule
+		base+2,    // timezone
+		base+3,    // enabled
+		base+4,    // next_run_date
+		endSQL,    // end_time
+		base+5,    // payload
+		base+6,    // metadata
+		orcSQL,    // on_run_completed
+		encCtxSQL, // encryption_context
 		insertFrom,
 		cronCols,
 		cronColsAliased(true),
@@ -881,6 +895,7 @@ func scanCronWithNow(row pgx.Row, c *Cron, dbNow *time.Time) error {
 		&c.Enabled,
 		&c.Timezone,
 		&c.OnRunCompleted,
+		&c.EncryptionContext,
 		dbNow,
 	)
 }

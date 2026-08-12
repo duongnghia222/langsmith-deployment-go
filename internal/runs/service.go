@@ -9,11 +9,13 @@ import (
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumca "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cancel_run_action"
 	enumcs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_control_signal"
 	enumms "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy"
 	enumrs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_run_status"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/config"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	lsdstream "github.com/duongnghia222/langsmith-deployment-go/internal/stream"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -121,16 +123,18 @@ func (s *Service) Stats(ctx context.Context, _ *emptypb.Empty) (*coreapi.RunStat
 // PoolStats implements RunsServer.PoolStats.
 //
 // Postgres mapping:
-//   PoolMax       = MaxConns()    — configured upper bound
-//   PoolSize      = TotalConns()  — currently open connections (idle + acquired + constructing)
-//   PoolAvailable = IdleConns()   — connections ready to use immediately
-//   RequestsQueued = EmptyAcquireCount() — times a caller had to wait because the pool was empty
-//   RequestsErrors = 0            — pgxpool does not expose a connection-error counter
+//
+//	PoolMax       = MaxConns()    — configured upper bound
+//	PoolSize      = TotalConns()  — currently open connections (idle + acquired + constructing)
+//	PoolAvailable = IdleConns()   — connections ready to use immediately
+//	RequestsQueued = EmptyAcquireCount() — times a caller had to wait because the pool was empty
+//	RequestsErrors = 0            — pgxpool does not expose a connection-error counter
 //
 // Redis mapping (via go-redis PoolStats):
-//   IdleConnections  = IdleConns    — connections not currently checked out
-//   InUseConnections = TotalConns - IdleConns
-//   MaxConnections   = TotalConns   — go-redis PoolStats has no separate MaxConns field
+//
+//	IdleConnections  = IdleConns    — connections not currently checked out
+//	InUseConnections = TotalConns - IdleConns
+//	MaxConnections   = TotalConns   — go-redis PoolStats has no separate MaxConns field
 func (s *Service) PoolStats(ctx context.Context, _ *emptypb.Empty) (*coreapi.ConnectionPoolStats, error) {
 	if s.rdb == nil {
 		return nil, status.Error(codes.Unavailable, "redis not configured")
@@ -215,9 +219,12 @@ func multitaskTextToEnum(s string) enumms.MultitaskStrategy {
 // Redis RPUSH to the run queue signals workers waiting on BLPOP.
 //
 // (item 1) req.UserId is forwarded to CreateRunInput.UserID for injection into
-//   kwargs.config.configurable.user_id (ops.py:1571 params["user_id"]).
+//
+//	kwargs.config.configurable.user_id (ops.py:1571 params["user_id"]).
+//
 // (item 3) req.IfNotExists is forwarded to CreateRunInput.IfNotExists; when
-//   CREATE_THREAD_IF_THREAD_NOT_EXISTS the store auto-creates the thread.
+//
+//	CREATE_THREAD_IF_THREAD_NOT_EXISTS the store auto-creates the thread.
 func (s *Service) Create(ctx context.Context, req *coreapi.CreateRunRequest) (*coreapi.CreateRunResponse, error) {
 	strategy := req.GetMultitaskStrategy().String()
 	in := CreateRunInput{
@@ -228,11 +235,20 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateRunRequest) (*c
 		Metadata:          req.GetMetadataJson(),
 		MultitaskStrategy: strategy,
 		AfterSeconds:      req.GetAfterSeconds(),
-		UserID:            req.GetUserId(),                       // (item 1)
-		IfNotExists:       int32(req.GetIfNotExists()),           // (item 3)
+		UserID:            req.GetUserId(),             // (item 1)
+		IfNotExists:       int32(req.GetIfNotExists()), // (item 3)
 	}
 	if req.RunId != nil {
 		in.RunID = req.GetRunId().GetValue()
+	}
+	// (fix round 1, finding 2) persist encryption_context so a later-claiming
+	// worker (Next, below) can retrieve it — nil stays nil (column stays NULL).
+	if ec := req.GetEncryptionContext(); ec != nil {
+		b, err := jsonbutil.Marshal(ec)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal encryption_context: %v", err)
+		}
+		in.EncryptionContext = b
 	}
 	res, err := s.store.Create(ctx, in, req.GetThreadFilters(), req.GetAssistantFilters())
 	if err != nil {
@@ -483,10 +499,22 @@ func (s *Service) Next(ctx context.Context, req *coreapi.NextRunRequest) (*corea
 	}
 	resp := &coreapi.NextRunResponse{}
 	for _, c := range claimed {
-		resp.Runs = append(resp.Runs, &coreapi.RunWithAttempt{
+		rwa := &coreapi.RunWithAttempt{
 			Run:     toPB(c.Run),
 			Attempt: c.Attempt,
-		})
+		}
+		// (fix round 1, finding 2) populate from the persisted column; nil/absent
+		// stays unset so extract_encryption_context (Python) sees None, not {}.
+		if len(c.Run.EncryptionContext) > 0 {
+			var ec encryption.EncryptionContext
+			if err := jsonbutil.Unmarshal(c.Run.EncryptionContext, &ec); err != nil {
+				slog.Default().Error("next: unparseable run encryption_context, skipping",
+					"run_id", c.Run.RunID, "err", err)
+			} else {
+				rwa.EncryptionContext = &ec
+			}
+		}
+		resp.Runs = append(resp.Runs, rwa)
 	}
 	return resp, nil
 }

@@ -52,6 +52,7 @@ type Run struct {
 	LeaseGeneration   int64
 	RunAfter          *time.Time // NULL when after_seconds was 0; deferred-start runs skipped by Next until reached
 	Attempt           int64      // (2k) number of times Next has claimed this run; distinct from LeaseGeneration fencing
+	EncryptionContext []byte     // NULL when no context was recorded at create time (fix round 1, finding 2)
 }
 
 // runCols is the SELECT projection for all Run fields, qualified with the
@@ -66,7 +67,8 @@ const runCols = `run.run_id::text, COALESCE(run.thread_id::text,''), COALESCE(ru
 	COALESCE(run.metadata, '{}'::jsonb)::text::bytea,
 	COALESCE(run.lease_generation, 0),
 	run.run_after,
-	COALESCE(run.attempt, 0)`
+	COALESCE(run.attempt, 0),
+	run.encryption_context::text::bytea`
 
 // Get returns the run with the given UUID string, optionally scoped to a
 // thread, and applying auth filters to the thread's metadata column.
@@ -298,6 +300,7 @@ func scanRun(row pgx.Row, r *Run) error {
 		&r.LeaseGeneration,
 		&r.RunAfter,
 		&r.Attempt,
+		&r.EncryptionContext,
 	)
 }
 
@@ -428,6 +431,13 @@ type CreateRunInput struct {
 	Metadata          []byte
 	MultitaskStrategy string // reject | rollback | interrupt | enqueue
 	AfterSeconds      uint64 // 0 → run immediately (run_after stays NULL)
+
+	// (fix round 1, finding 2) encryption_context, protojson-marshaled by
+	// service.Create via jsonbutil.Marshal. nil → column stays NULL (no
+	// context was present on the request), never defaulted to "{}" — Next()
+	// must be able to tell "absent" from "present but empty" apart (mirrors
+	// crons.py's next() semantics that extract_encryption_context now matches).
+	EncryptionContext []byte
 
 	// (item 1) user_id injected into kwargs.config.configurable.user_id.
 	// Precedence: request.user_id < thread.config > assistant.config (ops.py:1605-1610 COALESCE).
@@ -672,14 +682,24 @@ func (s *Store) Create(
 	//   $7::jsonb already carries caller metadata; we inject assistant_id only when
 	//   the caller did not provide it, using jsonb_build_object || $7 so caller wins.
 	insertArgs := []any{
-		in.RunID,    // $1 — empty string ⇒ generate
-		in.ThreadID, // $2
-		in.AssistantID, // $3
-		in.Status,      // $4
-		in.KwargsJSON,  // $5
+		in.RunID,             // $1 — empty string ⇒ generate
+		in.ThreadID,          // $2
+		in.AssistantID,       // $3
+		in.Status,            // $4
+		in.KwargsJSON,        // $5
 		in.MultitaskStrategy, // $6
 		in.Metadata,          // $7
 		in.UserID,            // $8 — user_id fallback (item 1)
+	}
+	// (fix round 1, finding 2) encryption_context: nullable, no COALESCE —
+	// mirrors the EndTime/OnRunCompleted optional-column idiom in
+	// crons/store.go's Create(). Appended before the AfterSeconds arg so that
+	// AfterSeconds's dynamic $N numbering (computed from len(insertArgs))
+	// shifts automatically.
+	encCtxSQL := "NULL"
+	if in.EncryptionContext != nil {
+		insertArgs = append(insertArgs, in.EncryptionContext)
+		encCtxSQL = fmt.Sprintf("$%d::jsonb", len(insertArgs))
 	}
 	runAfterExpr := "NULL"
 	// (2n) created_at defaults to now(); when after_seconds > 0 both run_after
@@ -700,7 +720,7 @@ func (s *Store) Create(
 		)
 		INSERT INTO run (
 			run_id, thread_id, assistant_id, status, kwargs, multitask_strategy, metadata,
-			run_after, created_at, updated_at
+			encryption_context, run_after, created_at, updated_at
 		)
 		SELECT
 			new_id.run_id,
@@ -737,11 +757,13 @@ func (s *Store) Create(
 			jsonb_build_object('assistant_id', a.assistant_id::text) || $7::jsonb,
 			%s,
 			%s,
+			%s,
 			now()
 		FROM new_id, assistant a, thread t
 		WHERE a.assistant_id = $3::uuid
 		  AND t.thread_id    = $2::uuid
 		RETURNING %s`,
+		encCtxSQL,
 		runAfterExpr,
 		createdAtExpr,
 		runCols,

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumcronorc "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cron_on_run_completed"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -237,6 +239,15 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateCronRequest) (*
 	if req.OnRunCompleted != nil {
 		in.OnRunCompleted = req.GetOnRunCompleted().String()
 	}
+	// (fix round 1, finding 2) persist encryption_context so a later-claiming
+	// scheduler tick (Next, below) can retrieve it — nil stays nil (column stays NULL).
+	if ec := req.GetEncryptionContext(); ec != nil {
+		b, err := jsonbutil.Marshal(ec)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		in.EncryptionContext = b
+	}
 	c, err := s.store.Create(ctx, in)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -334,10 +345,22 @@ func (s *Service) Next(ctx context.Context, _ *emptypb.Empty) (*coreapi.NextCron
 	}
 	resp := &coreapi.NextCronsResponse{}
 	for _, cw := range cs {
-		resp.Crons = append(resp.Crons, &coreapi.CronWithNow{
+		cwn := &coreapi.CronWithNow{
 			Cron: toPB(cw.Cron),
 			Now:  timestamppb.New(cw.Now), // DB now() snapshot (ops.py:2325)
-		})
+		}
+		// (fix round 1, finding 2) populate from the persisted column; nil/absent
+		// stays unset so extract_encryption_context (Python) sees None, not {}.
+		if len(cw.Cron.EncryptionContext) > 0 {
+			var ec encryption.EncryptionContext
+			if err := jsonbutil.Unmarshal(cw.Cron.EncryptionContext, &ec); err != nil {
+				slog.Default().Error("next: unparseable cron encryption_context, skipping",
+					"cron_id", cw.Cron.CronID, "err", err)
+			} else {
+				cwn.EncryptionContext = &ec
+			}
+		}
+		resp.Crons = append(resp.Crons, cwn)
 	}
 	return resp, nil
 }

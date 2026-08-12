@@ -443,6 +443,78 @@ func TestRunStore_Create_ReturnsLeaseGeneration(t *testing.T) {
 	}
 }
 
+// TestRunStore_Create_EncryptionContextRoundTrips is fix round 1, finding 2:
+// encryption_context must be persisted on create and readable back via Get
+// (which shares runCols/scanRun with Create's own RETURNING), not silently
+// dropped.
+func TestRunStore_Create_EncryptionContextRoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:          thID,
+		AssistantID:       aID,
+		KwargsJSON:        []byte(`{}`),
+		EncryptionContext: []byte(`{"model":"run"}`),
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(res.Run.EncryptionContext) == 0 {
+		t.Fatal("Create: EncryptionContext not returned, want persisted bytes")
+	}
+
+	got, err := store.Get(ctx, res.Run.RunID, "", nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	var ec map[string]any
+	if err := json.Unmarshal(got.EncryptionContext, &ec); err != nil {
+		t.Fatalf("unmarshal EncryptionContext: %v", err)
+	}
+	if ec["model"] != "run" {
+		t.Errorf("EncryptionContext.model = %v, want run", ec["model"])
+	}
+}
+
+// TestRunStore_Create_EncryptionContextAbsentStaysNil: a run created without
+// an encryption context must read back with the column genuinely NULL (nil
+// bytes), not "{}" — Next()/service.go relies on nil to leave the proto field
+// unset, which is what lets Python's extract_encryption_context (fix round 1,
+// finding 1) tell "absent" apart from "present but empty".
+func TestRunStore_Create_EncryptionContextAbsentStaysNil(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:    thID,
+		AssistantID: aID,
+		KwargsJSON:  []byte(`{}`),
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Run.EncryptionContext != nil {
+		t.Errorf("EncryptionContext = %q, want nil (column NULL)", res.Run.EncryptionContext)
+	}
+
+	got, err := store.Get(ctx, res.Run.RunID, "", nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EncryptionContext != nil {
+		t.Errorf("Get EncryptionContext = %q, want nil", got.EncryptionContext)
+	}
+}
+
 func TestRunStore_Delete_RemovesRow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -944,10 +1016,10 @@ func TestStore_Create_WithAfterSeconds_SetsRunAfter(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
 	res, err := store.Create(ctx, runs.CreateRunInput{
-		ThreadID:    thID,
-		AssistantID: aID,
-		KwargsJSON:  []byte(`{}`),
-		Metadata:    []byte(`{}`),
+		ThreadID:     thID,
+		AssistantID:  aID,
+		KwargsJSON:   []byte(`{}`),
+		Metadata:     []byte(`{}`),
 		AfterSeconds: 60,
 	}, nil, nil)
 	if err != nil {

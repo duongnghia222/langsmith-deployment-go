@@ -10,6 +10,7 @@ import (
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumca "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cancel_run_action"
 	enumms "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy"
 	enumrs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_run_status"
@@ -293,6 +294,85 @@ func TestRunService_Create_Enqueue_TwoRuns(t *testing.T) {
 	id2 := r2.GetRuns()[0].GetRunId().GetValue()
 	if id1 == id2 {
 		t.Fatal("two enqueue creates returned same run ID")
+	}
+}
+
+// TestRunService_Create_EncryptionContextRoundTripsThroughNext is fix round 1,
+// finding 2: encryption_context must be persisted on Create and populated back
+// onto RunWithAttempt when Next() claims the run, so a later-claiming async
+// worker (api/grpc/ops/runs.py's next()) can retrieve it.
+func TestRunService_Create_EncryptionContextRoundTripsThroughNext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+	thID := "55555555-5555-5555-5555-555555555555"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+
+	ec := &encryption.EncryptionContext{Metadata: map[string][]byte{"tenant_id": []byte(`"abc"`)}}
+	created, err := svc.Create(ctx, &coreapi.CreateRunRequest{
+		ThreadId:          &coreapi.UUID{Value: thID},
+		AssistantId:       &coreapi.UUID{Value: aID},
+		KwargsJson:        []byte(`{}`),
+		EncryptionContext: ec,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	runID := created.GetRuns()[0].GetRunId().GetValue()
+
+	next, err := svc.Next(ctx, &coreapi.NextRunRequest{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(next.GetRuns()) != 1 || next.GetRuns()[0].GetRun().GetRunId().GetValue() != runID {
+		t.Fatalf("Next: got %d runs, want 1 matching %s", len(next.GetRuns()), runID)
+	}
+	got := next.GetRuns()[0].GetEncryptionContext()
+	if got == nil {
+		t.Fatal("RunWithAttempt.EncryptionContext = nil, want populated from the persisted column")
+	}
+	if string(got.GetMetadata()["tenant_id"]) != `"abc"` {
+		t.Errorf("EncryptionContext.metadata[tenant_id] = %q, want %q", got.GetMetadata()["tenant_id"], `"abc"`)
+	}
+}
+
+// TestRunService_Create_EncryptionContextAbsent_NextLeavesItUnset is fix round
+// 1, finding 2's absence case: a run created without an encryption context
+// must come back from Next() with the field genuinely unset (nil), not an
+// empty message — Python's extract_encryption_context (finding 1) only falls
+// back to the blob-marker path when it sees None.
+func TestRunService_Create_EncryptionContextAbsent_NextLeavesItUnset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+	thID := "66666666-6666-6666-6666-666666666666"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+
+	created, err := svc.Create(ctx, &coreapi.CreateRunRequest{
+		ThreadId:    &coreapi.UUID{Value: thID},
+		AssistantId: &coreapi.UUID{Value: aID},
+		KwargsJson:  []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	runID := created.GetRuns()[0].GetRunId().GetValue()
+
+	next, err := svc.Next(ctx, &coreapi.NextRunRequest{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(next.GetRuns()) != 1 || next.GetRuns()[0].GetRun().GetRunId().GetValue() != runID {
+		t.Fatalf("Next: got %d runs, want 1 matching %s", len(next.GetRuns()), runID)
+	}
+	if next.GetRuns()[0].EncryptionContext != nil {
+		t.Errorf("RunWithAttempt.EncryptionContext = %v, want nil (unset)", next.GetRuns()[0].EncryptionContext)
 	}
 }
 

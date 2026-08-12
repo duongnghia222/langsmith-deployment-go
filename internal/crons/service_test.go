@@ -6,6 +6,7 @@ import (
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumcronorc "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cron_on_run_completed"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/crons"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
@@ -367,6 +368,102 @@ func TestService_Next_ExcludesExpired(t *testing.T) {
 	}
 	if _, ok := ids[activeID]; !ok {
 		t.Errorf("active cron %s should be returned by Next", activeID)
+	}
+}
+
+// TestService_Create_EncryptionContextRoundTripsThroughNext is fix round 1,
+// finding 2: encryption_context must be persisted on Create and populated
+// back onto CronWithNow when Next() claims a due cron, so a later-claiming
+// scheduler tick (api/grpc/ops/crons.py's next()) can retrieve it.
+func TestService_Create_EncryptionContextRoundTripsThroughNext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "svc-enc-ctx-graph", nil)
+
+	ec := &encryption.EncryptionContext{Metadata: map[string][]byte{"tenant_id": []byte(`"abc"`)}}
+	created, err := svc.Create(ctx, &coreapi.CreateCronRequest{
+		Schedule:          "* * * * *",
+		Payload:           &coreapi.CronPayload{AssistantId: aID},
+		Enabled:           true,
+		EncryptionContext: ec,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cronID := created.GetCronId().GetValue()
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, cronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	resp, err := svc.Next(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var got *coreapi.CronWithNow
+	for _, cw := range resp.GetCrons() {
+		if cw.GetCron().GetCronId().GetValue() == cronID {
+			got = cw
+		}
+	}
+	if got == nil {
+		t.Fatalf("cron %s not returned by Next", cronID)
+	}
+	gotEC := got.GetEncryptionContext()
+	if gotEC == nil {
+		t.Fatal("CronWithNow.EncryptionContext = nil, want populated from the persisted column")
+	}
+	if string(gotEC.GetMetadata()["tenant_id"]) != `"abc"` {
+		t.Errorf("EncryptionContext.metadata[tenant_id] = %q, want %q", gotEC.GetMetadata()["tenant_id"], `"abc"`)
+	}
+}
+
+// TestService_Create_EncryptionContextAbsent_NextLeavesItUnset is fix round 1,
+// finding 2's absence case: a cron created without an encryption context must
+// come back from Next() with the field genuinely unset (nil), matching
+// finding 1's None-vs-empty-dict distinction on the Python side.
+func TestService_Create_EncryptionContextAbsent_NextLeavesItUnset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "svc-enc-ctx-absent-graph", nil)
+
+	created, err := svc.Create(ctx, &coreapi.CreateCronRequest{
+		Schedule: "* * * * *",
+		Payload:  &coreapi.CronPayload{AssistantId: aID},
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cronID := created.GetCronId().GetValue()
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, cronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	resp, err := svc.Next(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var got *coreapi.CronWithNow
+	for _, cw := range resp.GetCrons() {
+		if cw.GetCron().GetCronId().GetValue() == cronID {
+			got = cw
+		}
+	}
+	if got == nil {
+		t.Fatalf("cron %s not returned by Next", cronID)
+	}
+	if got.EncryptionContext != nil {
+		t.Errorf("CronWithNow.EncryptionContext = %v, want nil (unset)", got.EncryptionContext)
 	}
 }
 
