@@ -785,6 +785,38 @@ func TestRunStore_Sweep_ResetsExpiredLeaseToPending(t *testing.T) {
 	}
 }
 
+// TestRunStore_Sweep_IgnoresNullLease verifies 6a: a "running" run with a NULL
+// lease_expires_at (e.g. claimed via the Python/Redis queue path, which does
+// not set a Postgres lease) must never be swept back to pending — Sweep's
+// candidate query requires lease_expires_at IS NOT NULL AND < now().
+func TestRunStore_Sweep_IgnoresNullLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+	// testdb.MustInsertRun leaves lease_expires_at NULL by default.
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+
+	swept, err := store.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	for _, id := range swept {
+		if id == rID {
+			t.Fatalf("Sweep swept a run with a NULL lease: %v", swept)
+		}
+	}
+	r, err := store.Get(ctx, rID, "", nil)
+	if err != nil {
+		t.Fatalf("Get after sweep: %v", err)
+	}
+	if r.Status != "running" {
+		t.Errorf("after sweep status = %q, want running (NULL lease must not be swept)", r.Status)
+	}
+}
+
 // TestRunStore_Next_AttemptCountsClaimsNotLeaseGeneration proves 2k: attempt
 // tracks the number of times a run has been claimed via Next, independent of
 // lease_generation (which Sweep also bumps for fencing but which is not a
