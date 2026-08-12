@@ -2,11 +2,14 @@ package assistants_test
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	engcommon "github.com/duongnghia222/langsmith-deployment-go/gen/engine_common"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/assistants"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/crons"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -214,6 +217,14 @@ func TestService_Create_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestService_ConfigRoundTrip covers the fields that round-trip losslessly
+// through proto.Equal. GraphId and RunId are deliberately excluded: both are
+// genuine (Python-verified) asymmetries in config.py, not bugs —
+// config_from_proto puts them into configurable["graph_id"]/["run_id"], but
+// _inject_configurable_into_proto has no matching case for either key, so a
+// re-ingested dict's copy falls through to extra_configurable_json instead of
+// setting GraphId/RunId directly. See ConfigDictToProto's doc comment
+// (internal/crons/payload.go) for the ported, verbatim behavior.
 func TestService_ConfigRoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -221,13 +232,9 @@ func TestService_ConfigRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newTestService(t, ctx)
 
-	gid := "g-1"
-	runID := "r-1"
 	cfg := &engcommon.EngineRunnableConfig{
 		Tags:    []string{"alpha", "beta"},
 		RunName: proto.String("ingest"),
-		RunId:   &runID,
-		GraphId: &gid,
 	}
 
 	created, err := svc.Create(ctx, &coreapi.CreateAssistantRequest{
@@ -240,6 +247,79 @@ func TestService_ConfigRoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(created.GetConfig(), cfg) {
 		t.Fatalf("Create response config mismatch:\nwant=%v\ngot=%v", cfg, created.GetConfig())
+	}
+
+	got, err := svc.Get(ctx, &coreapi.GetAssistantRequest{AssistantId: created.GetAssistantId()})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !proto.Equal(got.GetConfig(), cfg) {
+		t.Fatalf("Get response config mismatch:\nwant=%v\ngot=%v", cfg, got.GetConfig())
+	}
+}
+
+// TestService_ConfigRoundTrip_DictShape is the brief-mandated 5f test: a
+// Python-shaped config dict (configurable/tags/recursion_limit) is converted
+// to proto (mirroring what the Python client does before the RPC), sent
+// through Create, and both the RAW stored JSONB column and the response
+// proto must equal the original — proving config is stored as ops.py:335's
+// Jsonb(config) dict shape, not protojson.
+func TestService_ConfigRoundTrip_DictShape(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+
+	dict := map[string]any{
+		"configurable":    map[string]any{"thread_id": "th-1"},
+		"tags":            []any{"t1", "t2"},
+		"recursion_limit": float64(25),
+	}
+	cfg := crons.ConfigDictToProto(dict)
+
+	created, err := svc.Create(ctx, &coreapi.CreateAssistantRequest{
+		GraphId: "g-dictcfg",
+		Name:    "dict-round-trip",
+		Config:  cfg,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !proto.Equal(created.GetConfig(), cfg) {
+		t.Fatalf("Create response config mismatch:\nwant=%v\ngot=%v", cfg, created.GetConfig())
+	}
+
+	// Raw column must be the Python-shaped dict verbatim, not protojson.
+	var raw []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT config::text FROM assistant WHERE assistant_id = $1::uuid`,
+		created.GetAssistantId(),
+	).Scan(&raw); err != nil {
+		t.Fatalf("query raw config: %v", err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("unmarshal stored config: %v", err)
+	}
+	if !reflect.DeepEqual(stored, dict) {
+		t.Fatalf("stored config = %#v, want %#v", stored, dict)
+	}
+
+	// Same treatment for assistant_versions.config (5f).
+	var rawVersion []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT config::text FROM assistant_versions WHERE assistant_id = $1::uuid AND "version" = 1`,
+		created.GetAssistantId(),
+	).Scan(&rawVersion); err != nil {
+		t.Fatalf("query raw version config: %v", err)
+	}
+	var storedVersion map[string]any
+	if err := json.Unmarshal(rawVersion, &storedVersion); err != nil {
+		t.Fatalf("unmarshal stored version config: %v", err)
+	}
+	if !reflect.DeepEqual(storedVersion, dict) {
+		t.Fatalf("stored version config = %#v, want %#v", storedVersion, dict)
 	}
 
 	got, err := svc.Get(ctx, &coreapi.GetAssistantRequest{AssistantId: created.GetAssistantId()})

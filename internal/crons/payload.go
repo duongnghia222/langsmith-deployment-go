@@ -57,7 +57,7 @@ func payloadDictToProto(payload map[string]any) *coreapi.CronPayload {
 	}
 	if v, ok := payload["config"]; ok && v != nil {
 		if cfgMap, ok := v.(map[string]any); ok {
-			if pc := configDictToProto(cfgMap); pc != nil {
+			if pc := ConfigDictToProto(cfgMap); pc != nil {
 				p.Config = pc
 			}
 		}
@@ -110,7 +110,7 @@ func payloadProtoToDict(p *coreapi.CronPayload) map[string]any {
 		result["webhook"] = *p.Webhook
 	}
 	if p.Config != nil {
-		result["config"] = configProtoToDict(p.Config)
+		result["config"] = ConfigProtoToDict(p.Config)
 	}
 	if p.InterruptBefore != nil {
 		if v, ok := staticInterruptConfigFromProto(p.InterruptBefore); ok {
@@ -178,15 +178,19 @@ var knownConfigTopLevelKeys = map[string]bool{
 	"recursion_limit": true, "tags": true, "configurable": true, "callbacks": true,
 }
 
-// configDictToProto is a scoped port of
+// ConfigDictToProto is a scoped port of
 // api/langgraph_grpc_common/conversion/config.py:config_to_proto, covering
-// the fields a stored cron payload's config template realistically carries:
-// metadata (with run_attempt/run_id specials), tags, run_name, run_id
-// (top-level or configurable, matching Python's `or`-fallback),
-// max_concurrency, recursion_limit, a handful of special configurable keys
+// the fields a stored config template realistically carries: metadata (with
+// run_attempt/run_id specials), tags, run_name, run_id (top-level or
+// configurable, matching Python's `or`-fallback), max_concurrency,
+// recursion_limit, a handful of special configurable keys
 // (resuming/task_id/thread_id/checkpoint_*/durability/root_stream_modes/
 // tracing_*), and generic extra_json/extra_configurable_json passthrough for
 // everything else.
+//
+// Exported for reuse by internal/assistants (assistant.config is stored in
+// the same Python-shaped-dict JSON as cron.payload's config field — see
+// jsonbutil's package doc).
 //
 // ponytail: `configurable.__pregel_runtime` (LangGraph Runtime/context) and
 // `configurable.__pregel_resume_map` (SerializedValue wire format) are not
@@ -194,7 +198,18 @@ var knownConfigTopLevelKeys = map[string]bool{
 // template would not realistically contain. Add a real port (see
 // config.py:runtime_to_proto / conversion/value.py) if a cron payload ever
 // needs one.
-func configDictToProto(cfg map[string]any) *engcommon.EngineRunnableConfig {
+//
+// Known asymmetry (matches config.py, not a bug): EngineRunnableConfig.graph_id
+// round-trips proto→dict (into configurable["graph_id"], config.py:115-116)
+// but NOT dict→proto — config.py's _inject_configurable_into_proto has no
+// "graph_id" case, so a re-ingested dict's configurable.graph_id falls
+// through to extra_configurable_json instead of GraphId. Ported verbatim.
+// RunId has the identical asymmetry: config.py:163-164 copies it into
+// configurable["run_id"] on the way out, but _inject_configurable_into_proto
+// has no "run_id" case either (config.py:267-333), so re-ingesting a dict
+// that carries it sets RunId AND ALSO adds extra_configurable_json["run_id"]
+// — a second copy the original proto never had.
+func ConfigDictToProto(cfg map[string]any) *engcommon.EngineRunnableConfig {
 	if len(cfg) == 0 {
 		return nil
 	}
@@ -344,9 +359,10 @@ func injectConfigurableIntoProto(configurable map[string]any, pb *engcommon.Engi
 	}
 }
 
-// configProtoToDict is the inverse of configDictToProto, scoped to the same
-// field set (config.py:config_from_proto, lines 41-76).
-func configProtoToDict(pb *engcommon.EngineRunnableConfig) map[string]any {
+// ConfigProtoToDict is the inverse of ConfigDictToProto, scoped to the same
+// field set (config.py:config_from_proto, lines 41-76). Exported for reuse
+// by internal/assistants (see ConfigDictToProto's doc comment).
+func ConfigProtoToDict(pb *engcommon.EngineRunnableConfig) map[string]any {
 	cfg := map[string]any{}
 	if pb == nil {
 		return cfg
@@ -396,7 +412,7 @@ func configProtoToDict(pb *engcommon.EngineRunnableConfig) map[string]any {
 }
 
 // configurableFromProto ports config.py:_configurable_from_proto (lines
-// 89-170), minus the runtime/resume_map fields (see configDictToProto's
+// 89-170), minus the runtime/resume_map fields (see ConfigDictToProto's
 // ponytail note) and __pregel_stream (a non-serializable StreamProtocol
 // callable in Python with no meaningful Go/storage representation).
 func configurableFromProto(pb *engcommon.EngineRunnableConfig) map[string]any {

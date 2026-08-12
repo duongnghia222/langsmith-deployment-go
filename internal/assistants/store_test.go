@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/assistants"
@@ -289,7 +290,8 @@ func TestStore_Patch_WritesVersionName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	_, err = store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "renamed"}, nil)
+	renamedName := "renamed"
+	_, err = store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &renamedName}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -322,7 +324,8 @@ func TestStore_Patch_BumpsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "patched"}, nil)
+	patchedName := "patched"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &patchedName}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -341,7 +344,7 @@ func TestStore_Delete_RemovesRow(t *testing.T) {
 	ctx := context.Background()
 	store, pool := newTestStore(t, ctx)
 	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
-	deleted, err := store.Delete(ctx, aID, nil)
+	deleted, err := store.Delete(ctx, aID, false, nil)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -351,6 +354,67 @@ func TestStore_Delete_RemovesRow(t *testing.T) {
 	_, err = store.Get(ctx, aID, nil)
 	if !errors.Is(err, assistants.ErrNotFound) {
 		t.Errorf("after delete Get = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_Delete_NoMatch_ReturnsEmpty verifies Delete on a nonexistent ID
+// returns an empty slice with no error, not ErrNotFound — the Go-service
+// contract (Service.Delete always returns a list, empty or not); the Python
+// client (5b) is responsible for turning an empty list into a 404.
+func TestStore_Delete_NoMatch_ReturnsEmpty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	deleted, err := store.Delete(ctx, "00000000-0000-0000-0000-000000000000", false, nil)
+	if err != nil {
+		t.Fatalf("Delete on missing id: want nil error, got %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Errorf("deleted = %v, want empty", deleted)
+	}
+}
+
+// TestStore_Delete_ThreadsFlag verifies delete_threads (5b, LSD-only — no
+// Python parity): when true, threads tagged with the assistant_id via
+// metadata->>'assistant_id' are also removed in the same transaction; when
+// false (default), threads are left untouched.
+func TestStore_Delete_ThreadsFlag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+
+	// Assistant whose threads WILL be swept.
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads", nil)
+	threadID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"assistant_id":"`+aID+`"}`))
+
+	// Unrelated assistant + thread that must survive untouched.
+	otherID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads-other", nil)
+	otherThreadID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"assistant_id":"`+otherID+`"}`))
+
+	deleted, err := store.Delete(ctx, aID, true, nil)
+	if err != nil {
+		t.Fatalf("Delete with delete_threads: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != aID {
+		t.Errorf("deleted IDs = %v, want [%s]", deleted, aID)
+	}
+
+	threadExists := func(id string) bool {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM thread WHERE thread_id = $1::uuid)`, id).Scan(&exists); err != nil {
+			t.Fatalf("check thread existence: %v", err)
+		}
+		return exists
+	}
+	if threadExists(threadID) {
+		t.Errorf("thread %s still exists after delete_threads=true", threadID)
+	}
+	if !threadExists(otherThreadID) {
+		t.Errorf("unrelated thread %s was removed; delete_threads must scope to this assistant only", otherThreadID)
 	}
 }
 
@@ -365,7 +429,8 @@ func TestStore_SetLatest_RollsBackVersion(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	// create version 2 via patch
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v2"}, nil); err != nil {
+	v2Name := "v2"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &v2Name}, nil); err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
 	// roll back to version 1
@@ -392,11 +457,13 @@ func TestStore_PatchAfterSetLatest_NoConflict(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	// versions = [1]
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v2"}, nil); err != nil {
+	name := "v2"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil); err != nil {
 		t.Fatalf("Patch v2: %v", err)
 	}
 	// versions = [1, 2]
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v3"}, nil); err != nil {
+	name = "v3"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil); err != nil {
 		t.Fatalf("Patch v3: %v", err)
 	}
 	// versions = [1, 2, 3]
@@ -404,7 +471,8 @@ func TestStore_PatchAfterSetLatest_NoConflict(t *testing.T) {
 		t.Fatalf("SetLatest: %v", err)
 	}
 	// versions = [1, 2, 3] (preserved); assistant.version = 1
-	final, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v4"}, nil)
+	name = "v4"
+	final, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil)
 	if err != nil {
 		t.Fatalf("Patch after SetLatest: %v", err)
 	}
@@ -502,6 +570,69 @@ func TestStore_Patch_VersionRowMetadata(t *testing.T) {
 	}
 }
 
+// TestStore_Patch_EmptyStringClearsNameAndDescription verifies (5e) that an
+// explicit "" is applied, not treated as absent — ops.py:457-461 use
+// `if name is not None` / `if description is not None`, so unlike the zero
+// value of a non-pointer field, PatchInput.Name/Description being non-nil
+// (even "") must overwrite the existing value.
+func TestStore_Patch_EmptyStringClearsNameAndDescription(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	desc := "original-desc"
+	a, err := store.Create(ctx, assistants.CreateInput{
+		GraphID:     "g-clear",
+		Name:        "original-name",
+		Description: &desc,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	empty := ""
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{
+		Name:        &empty,
+		Description: &empty,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Name != "" {
+		t.Errorf("Name = %q, want empty string (explicit clear)", patched.Name)
+	}
+	if patched.Description == nil || *patched.Description != "" {
+		t.Errorf("Description = %v, want empty string (explicit clear)", patched.Description)
+	}
+}
+
+// TestStore_Patch_NilNameLeavesExisting verifies that PatchInput.Name == nil
+// (not provided) leaves the existing name untouched, distinguishing "unset"
+// from "explicitly cleared" (5e).
+func TestStore_Patch_NilNameLeavesExisting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	a, err := store.Create(ctx, assistants.CreateInput{GraphID: "g-nilname", Name: "keep-me"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{
+		GraphID: "g-nilname-2",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Name != "keep-me" {
+		t.Errorf("Name = %q, want keep-me (nil Name must not touch existing name)", patched.Name)
+	}
+}
+
 // TestStore_Patch_UpdatedAtMatchesVersionCreatedAt verifies that the assistant's
 // updated_at equals the version row's created_at — ops.py:488.
 func TestStore_Patch_UpdatedAtMatchesVersionCreatedAt(t *testing.T) {
@@ -515,7 +646,8 @@ func TestStore_Patch_UpdatedAtMatchesVersionCreatedAt(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "renamed"}, nil)
+	renamed := "renamed"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &renamed}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -702,6 +834,40 @@ func TestStore_SetLatest_PreservesGraphIDContextDescription(t *testing.T) {
 	// description must remain as-is.
 	if rolled.Description == nil || *rolled.Description != "patched-desc" {
 		t.Errorf("Description = %v, want patched-desc (SetLatest must not revert description)", rolled.Description)
+	}
+}
+
+// TestStore_SetLatest_DoesNotBumpUpdatedAt verifies (5d) that SetLatest's SET
+// clause has no updated_at — ops.py:556-563 restores config/metadata/version
+// only, so rolling back a version must not look like a fresh edit.
+func TestStore_SetLatest_DoesNotBumpUpdatedAt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	a, err := store.Create(ctx, assistants.CreateInput{GraphID: "g-ts2", Name: "v1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	name := "v2"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	beforeUpdatedAt := patched.UpdatedAt
+
+	// Sleep past typical timestamp resolution so a spurious now() bump would
+	// be detectable rather than accidentally landing on the same instant.
+	time.Sleep(10 * time.Millisecond)
+
+	rolled, err := store.SetLatest(ctx, a.AssistantID, 1, nil)
+	if err != nil {
+		t.Fatalf("SetLatest: %v", err)
+	}
+	if !rolled.UpdatedAt.Equal(beforeUpdatedAt) {
+		t.Errorf("updated_at = %v, want unchanged %v (SetLatest must not bump updated_at)", rolled.UpdatedAt, beforeUpdatedAt)
 	}
 }
 
