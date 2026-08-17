@@ -23,7 +23,7 @@ type Config struct {
 	// CRON_SCHEDULER_SLEEP_TIME=5 (api/config/__init__.py:427).
 	CronInterval time.Duration
 	LogLevel     string
-	Env                    string
+	Env          string
 
 	// StreamCfg controls Redis Streams behaviour (R4).
 	StreamMaxLen      int64
