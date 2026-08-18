@@ -34,8 +34,8 @@ func TestMigrate_AppliesAllUpMigrations(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT value FROM lsd_meta WHERE key='schema_version'").Scan(&version); err != nil {
 		t.Fatalf("query lsd_meta: %v", err)
 	}
-	if version != "15" {
-		t.Errorf("schema_version = %q, want 15", version)
+	if version != "18" {
+		t.Errorf("schema_version = %q, want 18", version)
 	}
 
 	// Idempotent: running again is a no-op.
@@ -116,7 +116,7 @@ func TestMigrate_FreshDB(t *testing.T) {
 		"SELECT value FROM lsd_meta WHERE key='schema_version'").Scan(&version); err != nil {
 		t.Fatalf("query lsd_meta: %v", err)
 	}
-	if version != "15" {
-		t.Errorf("schema_version = %q, want 15", version)
+	if version != "18" {
+		t.Errorf("schema_version = %q, want 18", version)
 	}
 }

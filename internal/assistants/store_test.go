@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/assistants"
@@ -173,6 +174,12 @@ func TestStore_GetVersions(t *testing.T) {
 	}
 }
 
+// TestStore_GetVersions_RespectsAuth proves GetVersions' auth filter is
+// applied against the PARENT ASSISTANT's metadata (ops.py:588-600 joins
+// assistant USING(assistant_id) and filters assistant.metadata), not each
+// version row's own metadata. A matching assistant makes ALL of its versions
+// visible; a mismatching assistant hides ALL of them, even though the
+// per-version metadata never enters into it.
 func TestStore_GetVersions_RespectsAuth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -180,32 +187,27 @@ func TestStore_GetVersions_RespectsAuth(t *testing.T) {
 	ctx := context.Background()
 	store, pool := newTestStore(t, ctx)
 
-	// Insert a parent assistant (metadata on the assistant itself is irrelevant here).
-	id := testdb.MustInsertAssistant(t, ctx, pool, "graph-auth", nil)
+	// Parent assistant's own metadata is the auth filter target.
+	id := testdb.MustInsertAssistant(t, ctx, pool, "graph-auth", []byte(`{"tenant":"alpha"}`))
+	testdb.MustInsertAssistantVersion(t, ctx, pool, id, 1, "graph-auth", []byte(`{"v":1}`))
+	testdb.MustInsertAssistantVersion(t, ctx, pool, id, 2, "graph-auth", []byte(`{"v":2}`))
 
-	// Version 1 has tenant "alpha"; version 2 has tenant "beta".
-	testdb.MustInsertAssistantVersion(t, ctx, pool, id, 1, "graph-auth", []byte(`{"tenant":"alpha"}`))
-	testdb.MustInsertAssistantVersion(t, ctx, pool, id, 2, "graph-auth", []byte(`{"tenant":"beta"}`))
-
-	// Auth filter: only versions with tenant == "alpha" should be visible.
+	// Auth filter matches the parent assistant's metadata: both versions visible.
 	filters := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "tenant", Match: "alpha"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "tenant", Match: `"alpha"`}}},
 	}
-
 	versions, err := store.GetVersions(ctx, id, 10, 0, nil, filters)
 	if err != nil {
 		t.Fatalf("GetVersions with auth filter: %v", err)
 	}
-	if len(versions) != 1 {
-		t.Fatalf("len(versions) = %d, want 1 (only tenant=alpha)", len(versions))
-	}
-	if versions[0].Version != 1 {
-		t.Errorf("versions[0].Version = %d, want 1", versions[0].Version)
+	if len(versions) != 2 {
+		t.Fatalf("len(versions) = %d, want 2 (assistant's own metadata matches)", len(versions))
 	}
 
-	// Auth filter that matches no versions returns empty, no error.
+	// Auth filter mismatching the parent assistant's metadata hides ALL versions,
+	// regardless of any per-version metadata content.
 	noMatch := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "tenant", Match: "gamma"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "tenant", Match: `"beta"`}}},
 	}
 	none, err := store.GetVersions(ctx, id, 10, 0, nil, noMatch)
 	if err != nil {
@@ -288,7 +290,8 @@ func TestStore_Patch_WritesVersionName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	_, err = store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "renamed"}, nil)
+	renamedName := "renamed"
+	_, err = store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &renamedName}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -321,7 +324,8 @@ func TestStore_Patch_BumpsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "patched"}, nil)
+	patchedName := "patched"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &patchedName}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -340,7 +344,7 @@ func TestStore_Delete_RemovesRow(t *testing.T) {
 	ctx := context.Background()
 	store, pool := newTestStore(t, ctx)
 	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
-	deleted, err := store.Delete(ctx, aID, nil)
+	deleted, err := store.Delete(ctx, aID, false, nil)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -350,6 +354,111 @@ func TestStore_Delete_RemovesRow(t *testing.T) {
 	_, err = store.Get(ctx, aID, nil)
 	if !errors.Is(err, assistants.ErrNotFound) {
 		t.Errorf("after delete Get = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_Delete_NoMatch_ReturnsEmpty verifies Delete on a nonexistent ID
+// returns an empty slice with no error, not ErrNotFound — the Go-service
+// contract (Service.Delete always returns a list, empty or not); the Python
+// client (5b) is responsible for turning an empty list into a 404.
+func TestStore_Delete_NoMatch_ReturnsEmpty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	deleted, err := store.Delete(ctx, "00000000-0000-0000-0000-000000000000", false, nil)
+	if err != nil {
+		t.Fatalf("Delete on missing id: want nil error, got %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Errorf("deleted = %v, want empty", deleted)
+	}
+}
+
+// TestStore_Delete_ThreadsFlag verifies delete_threads (5b, LSD-only — no
+// Python parity): when true, threads tagged with the assistant_id via
+// metadata->>'assistant_id' are also removed in the same transaction; when
+// false (default), threads are left untouched.
+func TestStore_Delete_ThreadsFlag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+
+	// Assistant whose threads WILL be swept.
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads", nil)
+	threadID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"assistant_id":"`+aID+`"}`))
+
+	// Unrelated assistant + thread that must survive untouched.
+	otherID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads-other", nil)
+	otherThreadID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"assistant_id":"`+otherID+`"}`))
+
+	deleted, err := store.Delete(ctx, aID, true, nil)
+	if err != nil {
+		t.Fatalf("Delete with delete_threads: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != aID {
+		t.Errorf("deleted IDs = %v, want [%s]", deleted, aID)
+	}
+
+	threadExists := func(id string) bool {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM thread WHERE thread_id = $1::uuid)`, id).Scan(&exists); err != nil {
+			t.Fatalf("check thread existence: %v", err)
+		}
+		return exists
+	}
+	if threadExists(threadID) {
+		t.Errorf("thread %s still exists after delete_threads=true", threadID)
+	}
+	if !threadExists(otherThreadID) {
+		t.Errorf("unrelated thread %s was removed; delete_threads must scope to this assistant only", otherThreadID)
+	}
+}
+
+// TestStore_Delete_ThreadsFlag_AuthFiltersScopeSweep verifies fix round 1
+// finding 4: the delete_threads sweep must apply the same auth filter used
+// to authorize the assistant delete, not delete threads unconditionally.
+// A thread tagged with this assistant_id but whose own metadata doesn't
+// satisfy the filter (foreign owner) must survive even though
+// delete_threads=true and the assistant delete itself succeeded.
+func TestStore_Delete_ThreadsFlag_AuthFiltersScopeSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g-threads-auth", []byte(`{"owner":"alice"}`))
+	// Foreign-owned thread: tagged with this assistant_id, but its own
+	// metadata doesn't satisfy the "owner":"alice" filter below.
+	foreignThreadID := testdb.MustInsertThreadWithMeta(
+		t, ctx, pool, []byte(`{"assistant_id":"`+aID+`","owner":"bob"}`),
+	)
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+
+	deleted, err := store.Delete(ctx, aID, true, filters)
+	if err != nil {
+		t.Fatalf("Delete with delete_threads + auth filters: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != aID {
+		t.Fatalf("deleted IDs = %v, want [%s] (assistant itself matches the filter)", deleted, aID)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM thread WHERE thread_id = $1::uuid)`, foreignThreadID,
+	).Scan(&exists); err != nil {
+		t.Fatalf("check thread existence: %v", err)
+	}
+	if !exists {
+		t.Errorf("foreign-owned thread %s was deleted; delete_threads must scope the sweep to the "+
+			"same auth filter used for the assistant delete", foreignThreadID)
 	}
 }
 
@@ -364,7 +473,8 @@ func TestStore_SetLatest_RollsBackVersion(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	// create version 2 via patch
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v2"}, nil); err != nil {
+	v2Name := "v2"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &v2Name}, nil); err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
 	// roll back to version 1
@@ -391,11 +501,13 @@ func TestStore_PatchAfterSetLatest_NoConflict(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	// versions = [1]
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v2"}, nil); err != nil {
+	name := "v2"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil); err != nil {
 		t.Fatalf("Patch v2: %v", err)
 	}
 	// versions = [1, 2]
-	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v3"}, nil); err != nil {
+	name = "v3"
+	if _, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil); err != nil {
 		t.Fatalf("Patch v3: %v", err)
 	}
 	// versions = [1, 2, 3]
@@ -403,7 +515,8 @@ func TestStore_PatchAfterSetLatest_NoConflict(t *testing.T) {
 		t.Fatalf("SetLatest: %v", err)
 	}
 	// versions = [1, 2, 3] (preserved); assistant.version = 1
-	final, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "v4"}, nil)
+	name = "v4"
+	final, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil)
 	if err != nil {
 		t.Fatalf("Patch after SetLatest: %v", err)
 	}
@@ -501,6 +614,69 @@ func TestStore_Patch_VersionRowMetadata(t *testing.T) {
 	}
 }
 
+// TestStore_Patch_EmptyStringClearsNameAndDescription verifies (5e) that an
+// explicit "" is applied, not treated as absent — ops.py:457-461 use
+// `if name is not None` / `if description is not None`, so unlike the zero
+// value of a non-pointer field, PatchInput.Name/Description being non-nil
+// (even "") must overwrite the existing value.
+func TestStore_Patch_EmptyStringClearsNameAndDescription(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	desc := "original-desc"
+	a, err := store.Create(ctx, assistants.CreateInput{
+		GraphID:     "g-clear",
+		Name:        "original-name",
+		Description: &desc,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	empty := ""
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{
+		Name:        &empty,
+		Description: &empty,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Name != "" {
+		t.Errorf("Name = %q, want empty string (explicit clear)", patched.Name)
+	}
+	if patched.Description == nil || *patched.Description != "" {
+		t.Errorf("Description = %v, want empty string (explicit clear)", patched.Description)
+	}
+}
+
+// TestStore_Patch_NilNameLeavesExisting verifies that PatchInput.Name == nil
+// (not provided) leaves the existing name untouched, distinguishing "unset"
+// from "explicitly cleared" (5e).
+func TestStore_Patch_NilNameLeavesExisting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	a, err := store.Create(ctx, assistants.CreateInput{GraphID: "g-nilname", Name: "keep-me"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{
+		GraphID: "g-nilname-2",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if patched.Name != "keep-me" {
+		t.Errorf("Name = %q, want keep-me (nil Name must not touch existing name)", patched.Name)
+	}
+}
+
 // TestStore_Patch_UpdatedAtMatchesVersionCreatedAt verifies that the assistant's
 // updated_at equals the version row's created_at — ops.py:488.
 func TestStore_Patch_UpdatedAtMatchesVersionCreatedAt(t *testing.T) {
@@ -514,7 +690,8 @@ func TestStore_Patch_UpdatedAtMatchesVersionCreatedAt(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: "renamed"}, nil)
+	renamed := "renamed"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &renamed}, nil)
 	if err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
@@ -569,6 +746,62 @@ func TestStore_Create_AtomicDoNothing(t *testing.T) {
 	}
 	if second.Name != "original" {
 		t.Errorf("second.Name = %q, want original (do_nothing must return existing row)", second.Name)
+	}
+}
+
+// TestStore_Create_DoNothing_AuthFilters proves auth filters are applied to
+// the do_nothing "return pre-existing row" leg (ops.py:356-371): a matching
+// filter returns the existing assistant, a mismatching filter surfaces the
+// same ErrAlreadyExists as an unfiltered conflict (ops.py's fetchone(...,
+// not_found_code=409) treats "no row" identically whether caused by the
+// conflict itself or by the filter excluding it).
+func TestStore_Create_DoNothing_AuthFilters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	const id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+	if _, err := store.Create(ctx, assistants.CreateInput{
+		AssistantID: id,
+		GraphID:     "g-donothing-auth",
+		Name:        "original",
+		Metadata:    []byte(`{"owner":"alice"}`),
+		IfExists:    "do_nothing",
+	}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	matching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	second, err := store.Create(ctx, assistants.CreateInput{
+		AssistantID: id,
+		GraphID:     "g-donothing-auth",
+		Name:        "should-be-ignored",
+		IfExists:    "do_nothing",
+		Filters:     matching,
+	})
+	if err != nil {
+		t.Fatalf("do_nothing with matching filter: %v", err)
+	}
+	if second.Name != "original" {
+		t.Errorf("second.Name = %q, want original", second.Name)
+	}
+
+	mismatching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	_, err = store.Create(ctx, assistants.CreateInput{
+		AssistantID: id,
+		GraphID:     "g-donothing-auth",
+		Name:        "should-be-ignored",
+		IfExists:    "do_nothing",
+		Filters:     mismatching,
+	})
+	if !errors.Is(err, assistants.ErrAlreadyExists) {
+		t.Errorf("do_nothing with mismatching filter: want ErrAlreadyExists, got %v", err)
 	}
 }
 
@@ -645,6 +878,40 @@ func TestStore_SetLatest_PreservesGraphIDContextDescription(t *testing.T) {
 	// description must remain as-is.
 	if rolled.Description == nil || *rolled.Description != "patched-desc" {
 		t.Errorf("Description = %v, want patched-desc (SetLatest must not revert description)", rolled.Description)
+	}
+}
+
+// TestStore_SetLatest_DoesNotBumpUpdatedAt verifies (5d) that SetLatest's SET
+// clause has no updated_at — ops.py:556-563 restores config/metadata/version
+// only, so rolling back a version must not look like a fresh edit.
+func TestStore_SetLatest_DoesNotBumpUpdatedAt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	a, err := store.Create(ctx, assistants.CreateInput{GraphID: "g-ts2", Name: "v1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	name := "v2"
+	patched, err := store.Patch(ctx, a.AssistantID, assistants.PatchInput{Name: &name}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	beforeUpdatedAt := patched.UpdatedAt
+
+	// Sleep past typical timestamp resolution so a spurious now() bump would
+	// be detectable rather than accidentally landing on the same instant.
+	time.Sleep(10 * time.Millisecond)
+
+	rolled, err := store.SetLatest(ctx, a.AssistantID, 1, nil)
+	if err != nil {
+		t.Fatalf("SetLatest: %v", err)
+	}
+	if !rolled.UpdatedAt.Equal(beforeUpdatedAt) {
+		t.Errorf("updated_at = %v, want unchanged %v (SetLatest must not bump updated_at)", rolled.UpdatedAt, beforeUpdatedAt)
 	}
 }
 

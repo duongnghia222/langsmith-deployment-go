@@ -103,15 +103,18 @@ const assistantColsAliased = `a.assistant_id::text, COALESCE(a.graph_id, ''),
 	COALESCE(a."name", ''),
 	a.description`
 
-// assistantVersionCols is the SELECT projection for all AssistantVersion fields.
-const assistantVersionCols = `assistant_id::text, COALESCE(graph_id, ''),
-	COALESCE("name", ''),
-	COALESCE("version", 1),
-	created_at,
-	COALESCE(config, '{}'::jsonb)::text::bytea,
-	COALESCE(context, '{}'::jsonb)::text::bytea,
-	COALESCE(metadata, '{}'::jsonb)::text::bytea,
-	description`
+// assistantVersionCols is the SELECT projection for all AssistantVersion fields,
+// qualified with the assistant_versions. prefix: GetVersions optionally JOINs
+// assistant, which has same-named columns (version, graph_id, config, metadata,
+// created_at, context, description, name) that would otherwise be ambiguous.
+const assistantVersionCols = `assistant_versions.assistant_id::text, COALESCE(assistant_versions.graph_id, ''),
+	COALESCE(assistant_versions."name", ''),
+	COALESCE(assistant_versions."version", 1),
+	assistant_versions.created_at,
+	COALESCE(assistant_versions.config, '{}'::jsonb)::text::bytea,
+	COALESCE(assistant_versions.context, '{}'::jsonb)::text::bytea,
+	COALESCE(assistant_versions.metadata, '{}'::jsonb)::text::bytea,
+	assistant_versions.description`
 
 func scanAssistant(row pgx.Row) (*Assistant, error) {
 	var a Assistant
@@ -256,11 +259,14 @@ func (s *Store) Count(ctx context.Context, in SearchInput, filters []*coreapi.Au
 }
 
 // GetVersions returns the version history for the given assistant UUID, ordered
-// by version DESC. Auth filters are applied directly to assistant_versions.metadata,
-// so only versions whose metadata passes the filter are returned. An empty result
-// means either no versions exist or none satisfy the auth filter.
+// by version DESC. Auth filters are applied to the parent assistant's metadata
+// (ops.py:584-599: table_alias="assistant", JOIN assistant USING (assistant_id) —
+// only joined when filters are present), not each version row's own metadata.
+// An empty result means either no versions exist or the assistant is excluded
+// by the auth filter.
 //
-// metadataFilter applies assistant_versions.metadata @> $n::jsonb (ops.py:599).
+// metadataFilter applies assistant_versions.metadata @> $n::jsonb (ops.py:599) —
+// a separate, non-auth containment filter on the version row itself.
 func (s *Store) GetVersions(ctx context.Context, assistantID string, limit, offset uint64, metadataFilter []byte, filters []*coreapi.AuthFilter) ([]*AssistantVersion, error) {
 	if limit == 0 {
 		limit = 100
@@ -278,24 +284,27 @@ func (s *Store) GetVersions(ctx context.Context, assistantID string, limit, offs
 		idx++
 	}
 
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", idx)
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "assistant.metadata", idx)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
+	join := ""
 	if authSQL != "" {
+		join = "JOIN assistant USING (assistant_id)"
 		wheres = append(wheres, authSQL)
 		args = append(args, authArgs...)
 		idx += len(authArgs)
 	}
 
-	whereClause := "assistant_id = $1::uuid"
+	whereClause := "assistant_versions.assistant_id = $1::uuid"
 	if len(wheres) > 0 {
 		whereClause += " AND " + strings.Join(wheres, " AND ")
 	}
 
 	q := fmt.Sprintf(
-		`SELECT %s FROM assistant_versions WHERE %s ORDER BY "version" DESC LIMIT $%d OFFSET $%d`,
+		`SELECT %s FROM assistant_versions %s WHERE %s ORDER BY assistant_versions."version" DESC LIMIT $%d OFFSET $%d`,
 		assistantVersionCols,
+		join,
 		whereClause,
 		idx,
 		idx+1,
@@ -347,6 +356,11 @@ type CreateInput struct {
 	ContextJSON []byte // raw JSONB; nil → '{}'
 	Metadata    []byte // raw JSONB; nil → '{}'
 	IfExists    string // "do_nothing" | "raise" (default) — ops.py:356-374
+
+	// Filters are auth filters applied only to the do_nothing "return
+	// pre-existing row" leg (ops.py:356-371). Not used for raise mode: an
+	// INSERT conflict there already returns ErrAlreadyExists.
+	Filters []*coreapi.AuthFilter
 }
 
 // Create inserts a new assistant and version=1 row atomically using a single CTE,
@@ -428,11 +442,17 @@ SELECT %s FROM inserted_assistant`,
 	// raise (default): empty result set on conflict → ErrAlreadyExists.
 	var q string
 	if in.IfExists == "do_nothing" && in.AssistantID != "" {
+		// Auth filters apply only to this "return pre-existing row" leg.
+		authSQL, authArgs, err := auth.ApplyToQuery(in.Filters, "metadata", len(args)+1)
+		if err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
 		q = insertSQL + fmt.Sprintf(`
 UNION ALL
 SELECT %s FROM assistant
-WHERE assistant_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted_assistant)
-LIMIT 1`, assistantCols)
+WHERE assistant_id = $1::uuid AND NOT EXISTS (SELECT 1 FROM inserted_assistant)%s
+LIMIT 1`, assistantCols, prefixWithAnd(authSQL))
+		args = append(args, authArgs...)
 	} else {
 		q = insertSQL
 	}
@@ -456,7 +476,7 @@ LIMIT 1`, assistantCols)
 // PatchInput carries optional fields to update on an assistant.
 // Zero values are ignored (not written).
 type PatchInput struct {
-	Name        string
+	Name        *string // (5e) presence-tracked: nil = unset, ""=explicit clear (ops.py:457-458 uses "is not None")
 	Description *string
 	GraphID     string
 	Config      []byte
@@ -547,10 +567,11 @@ func (s *Store) Patch(ctx context.Context, assistantID string, in PatchInput, fi
 	}
 
 	// name for version row (LSD-only column, not in Python): use patched name or current.
+	// (5e) nil = unset (fall back to current); non-nil (incl. "") = explicit value.
 	var nameExpr string
-	if in.Name != "" {
+	if in.Name != nil {
 		nameExpr = fmt.Sprintf("COALESCE($%d, current_assistant.\"name\")", idx)
-		args = append(args, in.Name)
+		args = append(args, *in.Name)
 		idx++
 	} else {
 		nameExpr = `current_assistant."name"`
@@ -575,8 +596,8 @@ func (s *Store) Patch(ctx context.Context, assistantID string, in PatchInput, fi
 		// (ops.py:455) metadata = assistant.metadata || $n::jsonb  (MERGE, not replace)
 		sets = append(sets, fmt.Sprintf(`metadata = %s`, metaUpdateExpr))
 	}
-	if in.Name != "" {
-		sets = append(sets, fmt.Sprintf(`"name" = $%d`, findArgIdx(args, in.Name, nameExpr)))
+	if in.Name != nil {
+		sets = append(sets, fmt.Sprintf(`"name" = $%d`, findArgIdx(args, *in.Name, nameExpr)))
 	}
 	if in.Description != nil {
 		sets = append(sets, fmt.Sprintf(`description = $%d`, findArgIdx(args, *in.Description, descExpr)))
@@ -659,29 +680,67 @@ func findArgIdx(args []any, val any, _ string) int {
 
 // Delete removes the assistant(s) matching assistantID and optional auth filters.
 // Returns the list of deleted assistant UUIDs as strings.
-func (s *Store) Delete(ctx context.Context, assistantID string, filters []*coreapi.AuthFilter) ([]string, error) {
+//
+// (5b) deleteThreads: when set, threads tagged with this assistant_id are also
+// removed in the same transaction (thread FK cascades handle runs/checkpoints).
+// No Python parity for this flag — it's an LSD-only convenience addition;
+// ops.py:498-524 has no delete_threads parameter at all.
+func (s *Store) Delete(ctx context.Context, assistantID string, deleteThreads bool, filters []*coreapi.AuthFilter) ([]string, error) {
 	authSQL, args, err := auth.ApplyToQuery(filters, "metadata", 2)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
 	q := fmt.Sprintf(
 		`DELETE FROM assistant WHERE assistant_id = $1::uuid%s RETURNING assistant_id::text`,
 		prefixWithAnd(authSQL),
 	)
-	rows, err := s.pool.Query(ctx, q, append([]any{assistantID}, args...)...)
+	rows, err := tx.Query(ctx, q, append([]any{assistantID}, args...)...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	return ids, rows.Err()
+	closeErr := rows.Err()
+	rows.Close()
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	if deleteThreads && len(ids) > 0 {
+		// Reuse the same auth-filter fragment/args used for the assistant
+		// DELETE above (controller ruling, overriding the brief's unfiltered
+		// SQL): internal/threads/store.go:440-446 gates its own thread
+		// deletes on auth filters too, and applying no filter here would let
+		// delete_threads sweep threads regardless of ownership. Nil-filter
+		// callers are unchanged; filtered callers only sweep threads they
+		// can see.
+		tq := fmt.Sprintf(
+			`DELETE FROM thread WHERE metadata->>'assistant_id' = $1::text%s`,
+			prefixWithAnd(authSQL),
+		)
+		if _, err := tx.Exec(ctx, tq, append([]any{assistantID}, args...)...); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // SetLatest rolls the assistant pointer to the given version by copying only
@@ -689,6 +748,8 @@ func (s *Store) Delete(ctx context.Context, assistantID string, filters []*corea
 //
 // (ops.py:556-560) Python restores ONLY config, metadata, version — not graph_id,
 // context, or description. Those fields remain as they are on the assistant row.
+// (5d) updated_at is deliberately NOT bumped here — ops.py's SET list has no
+// updated_at either, so rolling back a version must not look like a fresh edit.
 func (s *Store) SetLatest(ctx context.Context, assistantID string, version int64, filters []*coreapi.AuthFilter) (*Assistant, error) {
 	authSQL, authArgs, err := auth.ApplyToQuery(filters, "a.metadata", 2)
 	if err != nil {
@@ -705,8 +766,7 @@ func (s *Store) SetLatest(ctx context.Context, assistantID string, version int64
 		UPDATE assistant a
 		SET config    = versioned_assistant.config,
 		    metadata  = versioned_assistant.metadata,
-		    "version" = versioned_assistant."version",
-		    updated_at = now()
+		    "version" = versioned_assistant."version"
 		FROM versioned_assistant
 		WHERE a.assistant_id = $1::uuid%s
 		RETURNING %s`,

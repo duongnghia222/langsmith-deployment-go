@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
@@ -160,6 +161,40 @@ func TestStore_Search(t *testing.T) {
 	}
 }
 
+// TestStore_Search_AuthFilterTargetsThreadMetadata proves Search's auth filter
+// is applied against the run's THREAD metadata, not the run's own metadata
+// (ops.py:1911-1946 joins thread and filters thread.metadata). MustInsertRun
+// always inserts run.metadata='{}', so a filter matching only via thread
+// metadata proves the join target; a mismatching thread metadata proves
+// exclusion.
+func TestStore_Search_AuthFilterTargetsThreadMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-auth-search", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+	testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.Search(ctx, runs.SearchInput{Limit: 10}, filters)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].ThreadID != matchThread {
+		t.Errorf("ThreadID = %q, want %q", results[0].ThreadID, matchThread)
+	}
+}
+
 func TestStore_Count(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -254,7 +289,7 @@ func TestRunStore_Create_Enqueue_NoCheck(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 	testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:          thID,
 		AssistantID:       aID,
 		MultitaskStrategy: "enqueue",
@@ -263,12 +298,17 @@ func TestRunStore_Create_Enqueue_NoCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create (enqueue): %v", err)
 	}
-	if r.RunID == "" {
+	if res.Run.RunID == "" {
 		t.Fatal("RunID empty")
 	}
 }
 
-func TestRunStore_Create_Interrupt_CancelsExisting(t *testing.T) {
+// TestRunStore_Create_Interrupt_ReturnsInflightWithoutMutating proves that
+// Create itself no longer flips displaced inflight runs (2d): it only reports
+// them via CreateResult.InflightRunIDs. The actual interrupt/rollback
+// transition is applied by service.Create via CancelWithAction — see
+// service_test.go for that behavior.
+func TestRunStore_Create_Interrupt_ReturnsInflightWithoutMutating(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -278,7 +318,7 @@ func TestRunStore_Create_Interrupt_CancelsExisting(t *testing.T) {
 	// pre-existing pending run on thread
 	existingID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:          thID,
 		AssistantID:       aID,
 		MultitaskStrategy: "interrupt",
@@ -287,16 +327,19 @@ func TestRunStore_Create_Interrupt_CancelsExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create (interrupt): %v", err)
 	}
-	if r.RunID == "" {
+	if res.Run.RunID == "" {
 		t.Fatal("RunID empty")
 	}
-	// Existing run should now be interrupted.
+	if len(res.InflightRunIDs) != 1 || res.InflightRunIDs[0] != existingID {
+		t.Errorf("InflightRunIDs = %v, want [%s]", res.InflightRunIDs, existingID)
+	}
+	// Create must not mutate the displaced run itself — that's service.Create's job.
 	existing, err := store.Get(ctx, existingID, "", nil)
 	if err != nil {
 		t.Fatalf("Get existing: %v", err)
 	}
-	if existing.Status != "interrupted" {
-		t.Errorf("existing run status = %q, want interrupted", existing.Status)
+	if existing.Status != "pending" {
+		t.Errorf("existing run status = %q, want pending (unchanged by store.Create)", existing.Status)
 	}
 }
 
@@ -343,7 +386,7 @@ func TestRunStore_Create_MergesGraphIDIntoConfigurable(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{"config":{"configurable":{"user_key":"u"}}}`),
@@ -351,6 +394,7 @@ func TestRunStore_Create_MergesGraphIDIntoConfigurable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	r := res.Run
 	var kw struct {
 		Config struct {
 			Configurable map[string]any `json:"configurable"`
@@ -385,7 +429,7 @@ func TestRunStore_Create_ReturnsLeaseGeneration(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -394,8 +438,80 @@ func TestRunStore_Create_ReturnsLeaseGeneration(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	// LeaseGeneration should be zero on a fresh row.
-	if r.LeaseGeneration != 0 {
-		t.Errorf("LeaseGeneration = %d, want 0", r.LeaseGeneration)
+	if res.Run.LeaseGeneration != 0 {
+		t.Errorf("LeaseGeneration = %d, want 0", res.Run.LeaseGeneration)
+	}
+}
+
+// TestRunStore_Create_EncryptionContextRoundTrips is fix round 1, finding 2:
+// encryption_context must be persisted on create and readable back via Get
+// (which shares runCols/scanRun with Create's own RETURNING), not silently
+// dropped.
+func TestRunStore_Create_EncryptionContextRoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:          thID,
+		AssistantID:       aID,
+		KwargsJSON:        []byte(`{}`),
+		EncryptionContext: []byte(`{"model":"run"}`),
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(res.Run.EncryptionContext) == 0 {
+		t.Fatal("Create: EncryptionContext not returned, want persisted bytes")
+	}
+
+	got, err := store.Get(ctx, res.Run.RunID, "", nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	var ec map[string]any
+	if err := json.Unmarshal(got.EncryptionContext, &ec); err != nil {
+		t.Fatalf("unmarshal EncryptionContext: %v", err)
+	}
+	if ec["model"] != "run" {
+		t.Errorf("EncryptionContext.model = %v, want run", ec["model"])
+	}
+}
+
+// TestRunStore_Create_EncryptionContextAbsentStaysNil: a run created without
+// an encryption context must read back with the column genuinely NULL (nil
+// bytes), not "{}" — Next()/service.go relies on nil to leave the proto field
+// unset, which is what lets Python's extract_encryption_context (fix round 1,
+// finding 1) tell "absent" apart from "present but empty".
+func TestRunStore_Create_EncryptionContextAbsentStaysNil(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:    thID,
+		AssistantID: aID,
+		KwargsJSON:  []byte(`{}`),
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Run.EncryptionContext != nil {
+		t.Errorf("EncryptionContext = %q, want nil (column NULL)", res.Run.EncryptionContext)
+	}
+
+	got, err := store.Get(ctx, res.Run.RunID, "", nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EncryptionContext != nil {
+		t.Errorf("Get EncryptionContext = %q, want nil", got.EncryptionContext)
 	}
 }
 
@@ -451,6 +567,80 @@ func TestRunStore_Delete_WrongThread(t *testing.T) {
 	_, err = store.Get(ctx, rID, "", nil)
 	if err != nil {
 		t.Errorf("run should still exist, got err: %v", err)
+	}
+}
+
+// TestRunStore_Delete_AuthFilter_WithThreadID proves the conditional JOIN
+// thread branch (runs/store.go, threadID != "" path) honors auth filters
+// against thread.metadata: a mismatching filter leaves the run untouched
+// (ErrNotFound, no rows joined), a matching filter deletes it.
+func TestRunStore_Delete_AuthFilter_WithThreadID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-delete-auth-thid", nil)
+	thID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+
+	mismatchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	if _, err := store.Delete(ctx, rID, thID, mismatchFilter); !errors.Is(err, runs.ErrNotFound) {
+		t.Fatalf("Delete with mismatching filter: want ErrNotFound, got %v", err)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); err != nil {
+		t.Errorf("run should survive mismatching filter, Get err: %v", err)
+	}
+
+	matchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	deleted, err := store.Delete(ctx, rID, thID, matchFilter)
+	if err != nil {
+		t.Fatalf("Delete with matching filter: %v", err)
+	}
+	if deleted != rID {
+		t.Errorf("deleted = %q, want %q", deleted, rID)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); !errors.Is(err, runs.ErrNotFound) {
+		t.Errorf("after delete: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestRunStore_Delete_AuthFilter_NoThreadID proves the same auth-filter join
+// in Delete's other branch (runs/store.go, threadID == "" path): a
+// mismatching filter leaves the run untouched, a matching filter deletes it.
+func TestRunStore_Delete_AuthFilter_NoThreadID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-delete-auth-nothid", nil)
+	thID := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+
+	mismatchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	if _, err := store.Delete(ctx, rID, "", mismatchFilter); !errors.Is(err, runs.ErrNotFound) {
+		t.Fatalf("Delete with mismatching filter: want ErrNotFound, got %v", err)
+	}
+	if _, err := store.Get(ctx, rID, "", nil); err != nil {
+		t.Errorf("run should survive mismatching filter, Get err: %v", err)
+	}
+
+	matchFilter := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	deleted, err := store.Delete(ctx, rID, "", matchFilter)
+	if err != nil {
+		t.Fatalf("Delete with matching filter: %v", err)
+	}
+	if deleted != rID {
+		t.Errorf("deleted = %q, want %q", deleted, rID)
 	}
 }
 
@@ -528,7 +718,11 @@ func TestRunStore_Cancel_Empty(t *testing.T) {
 	}
 }
 
-func TestRunStore_MarkDone_Success(t *testing.T) {
+// TestRunStore_MarkDone_DoesNotChangeStatus proves 2a: MarkDone releases the
+// lease but leaves run.status untouched — ops.py:1417-1437 documents that
+// enter()'s exit path only publishes control "done"; the run's terminal
+// status is owned exclusively by Threads.set_joint_status.
+func TestRunStore_MarkDone_DoesNotChangeStatus(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -537,19 +731,31 @@ func TestRunStore_MarkDone_Success(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
 
-	if err := store.MarkDone(ctx, rID, false); err != nil {
-		t.Fatalf("MarkDone(success): %v", err)
+	if err := store.MarkDone(ctx, rID); err != nil {
+		t.Fatalf("MarkDone: %v", err)
 	}
 	r, err := store.Get(ctx, rID, "", nil)
 	if err != nil {
 		t.Fatalf("Get after MarkDone: %v", err)
 	}
-	if r.Status != "success" {
-		t.Errorf("Status = %q, want success", r.Status)
+	if r.Status != "running" {
+		t.Errorf("Status = %q, want running (unchanged by MarkDone)", r.Status)
+	}
+	var leaseExpiresAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT lease_expires_at FROM run WHERE run_id = $1::uuid`, rID,
+	).Scan(&leaseExpiresAt); err != nil {
+		t.Fatalf("query lease_expires_at: %v", err)
+	}
+	if leaseExpiresAt != nil {
+		t.Errorf("lease_expires_at = %v, want NULL (lease released)", leaseExpiresAt)
 	}
 }
 
-func TestRunStore_MarkDone_Resumable(t *testing.T) {
+// TestRunStore_MarkDone_PreservesExplicitTerminalStatus proves MarkDone never
+// overwrites a status already set by SetStatus (Threads.set_joint_status in
+// Python), including the deleted "resumable" -> "interrupted" mapping.
+func TestRunStore_MarkDone_PreservesExplicitTerminalStatus(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -557,16 +763,19 @@ func TestRunStore_MarkDone_Resumable(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+	if err := store.SetStatus(ctx, rID, "error"); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
 
-	if err := store.MarkDone(ctx, rID, true); err != nil {
-		t.Fatalf("MarkDone(resumable): %v", err)
+	if err := store.MarkDone(ctx, rID); err != nil {
+		t.Fatalf("MarkDone: %v", err)
 	}
 	r, err := store.Get(ctx, rID, "", nil)
 	if err != nil {
 		t.Fatalf("Get after MarkDone: %v", err)
 	}
-	if r.Status != "interrupted" {
-		t.Errorf("Status = %q, want interrupted", r.Status)
+	if r.Status != "error" {
+		t.Errorf("Status = %q, want error (MarkDone must not overwrite)", r.Status)
 	}
 }
 
@@ -645,6 +854,81 @@ func TestRunStore_Sweep_ResetsExpiredLeaseToPending(t *testing.T) {
 	// (C8) Must be 'pending', not 'error' — Python ops.py:1467.
 	if r.Status != "pending" {
 		t.Errorf("after sweep status = %q, want pending (C8 parity)", r.Status)
+	}
+}
+
+// TestRunStore_Sweep_IgnoresNullLease verifies 6a: a "running" run with a NULL
+// lease_expires_at (e.g. claimed via the Python/Redis queue path, which does
+// not set a Postgres lease) must never be swept back to pending — Sweep's
+// candidate query requires lease_expires_at IS NOT NULL AND < now().
+func TestRunStore_Sweep_IgnoresNullLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+	// testdb.MustInsertRun leaves lease_expires_at NULL by default.
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+
+	swept, err := store.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	for _, id := range swept {
+		if id == rID {
+			t.Fatalf("Sweep swept a run with a NULL lease: %v", swept)
+		}
+	}
+	r, err := store.Get(ctx, rID, "", nil)
+	if err != nil {
+		t.Fatalf("Get after sweep: %v", err)
+	}
+	if r.Status != "running" {
+		t.Errorf("after sweep status = %q, want running (NULL lease must not be swept)", r.Status)
+	}
+}
+
+// TestRunStore_Next_AttemptCountsClaimsNotLeaseGeneration proves 2k: attempt
+// tracks the number of times a run has been claimed via Next, independent of
+// lease_generation (which Sweep also bumps for fencing but which is not a
+// claim). ops.py:1392-1400 increments attempt only on claim (Redis INCRBY).
+func TestRunStore_Next_AttemptCountsClaimsNotLeaseGeneration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID, thID := seedRunFixtures(t, ctx, pool)
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+
+	claimed, err := store.Next(ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("first Next: err=%v claimed=%d", err, len(claimed))
+	}
+	if claimed[0].Attempt != 1 {
+		t.Fatalf("attempt after first claim = %d, want 1", claimed[0].Attempt)
+	}
+
+	// Expire the lease and let Sweep requeue it. Sweep bumps lease_generation
+	// (fencing) but must NOT bump attempt.
+	if _, err := pool.Exec(ctx,
+		`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE run_id = $1::uuid`,
+		rID,
+	); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	swept, err := store.Sweep(ctx)
+	if err != nil || len(swept) != 1 {
+		t.Fatalf("Sweep: err=%v swept=%d", err, len(swept))
+	}
+
+	reclaimed, err := store.Next(ctx, 1)
+	if err != nil || len(reclaimed) != 1 {
+		t.Fatalf("second Next: err=%v claimed=%d", err, len(reclaimed))
+	}
+	if reclaimed[0].Attempt != 2 {
+		t.Errorf("attempt after sweep+reclaim = %d, want 2 (not 3)", reclaimed[0].Attempt)
 	}
 }
 
@@ -731,21 +1015,28 @@ func TestStore_Create_WithAfterSeconds_SetsRunAfter(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
-		ThreadID:    thID,
-		AssistantID: aID,
-		KwargsJSON:  []byte(`{}`),
-		Metadata:    []byte(`{}`),
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:     thID,
+		AssistantID:  aID,
+		KwargsJSON:   []byte(`{}`),
+		Metadata:     []byte(`{}`),
 		AfterSeconds: 60,
 	}, nil, nil)
 	if err != nil {
 		t.Fatalf("Create with AfterSeconds: %v", err)
 	}
+	r := res.Run
 	if r.RunAfter == nil {
 		t.Fatal("RunAfter is nil, want non-nil when AfterSeconds=60")
 	}
-	if !r.RunAfter.After(r.CreatedAt) {
-		t.Errorf("RunAfter (%v) should be after CreatedAt (%v)", r.RunAfter, r.CreatedAt)
+	// (2n) ops.py:1573 sets created_at = now() + after_seconds too, so the
+	// API-visible created_at (and search ordering) reflect the deferred start,
+	// not the insert time.
+	if !r.CreatedAt.After(time.Now().Add(30 * time.Second)) {
+		t.Errorf("CreatedAt = %v, want ~60s in the future (2n)", r.CreatedAt)
+	}
+	if !r.RunAfter.Equal(r.CreatedAt) {
+		t.Errorf("RunAfter (%v) should equal CreatedAt (%v) per ops.py:1573", r.RunAfter, r.CreatedAt)
 	}
 }
 
@@ -875,7 +1166,7 @@ func TestPublishExistsAndAuth(t *testing.T) {
 
 	// Auth filter match: owner=alice — must return nil.
 	matchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "alice"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
 	}
 	if err := store.PublishExistsAndAuth(ctx, runID, threadID, matchFilter); err != nil {
 		t.Errorf("matching auth filter: got err %v, want nil", err)
@@ -883,7 +1174,7 @@ func TestPublishExistsAndAuth(t *testing.T) {
 
 	// Auth filter mismatch: owner=bob — must return ErrForbidden.
 	mismatchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "bob"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
 	}
 	if err := store.PublishExistsAndAuth(ctx, runID, threadID, mismatchFilter); err == nil {
 		t.Error("mismatch auth filter: expected ErrForbidden, got nil")
@@ -983,6 +1274,154 @@ func TestStore_Cancel_InterruptTransitionsPending(t *testing.T) {
 	}
 	if r.Status != "interrupted" {
 		t.Errorf("pending run status after interrupt = %q, want interrupted", r.Status)
+	}
+}
+
+// runCancelRequestedAt reads cancel_requested_at directly since it isn't
+// exposed on the Run struct; used to prove a non-matching run's row was left
+// completely untouched by CancelWithAction's EXISTS-based auth filter (not
+// just that its status is unchanged).
+func runCancelRequestedAt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, runID string) *time.Time {
+	t.Helper()
+	var ts *time.Time
+	if err := pool.QueryRow(ctx, `SELECT cancel_requested_at FROM run WHERE run_id = $1::uuid`, runID).Scan(&ts); err != nil {
+		t.Fatalf("query cancel_requested_at for %s: %v", runID, err)
+	}
+	return ts
+}
+
+// TestStore_CancelWithAction_Interrupt_AuthFilter proves the EXISTS-correlated
+// auth filter (runs/store.go CancelWithAction, ops.py:1824-1832) is honored in
+// both the pending "interrupt" UPDATE and the running-runs UPDATE: a run on a
+// thread matching the filter is affected, a run on a non-matching thread is
+// left completely untouched.
+func TestStore_CancelWithAction_Interrupt_AuthFilter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-cancel-auth-int", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+
+	pendingMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	pendingMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+	runningMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "running")
+	runningMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "running")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.CancelWithAction(ctx,
+		[]string{pendingMatch, pendingMismatch, runningMatch, runningMismatch},
+		"", "interrupt", filters)
+	if err != nil {
+		t.Fatalf("CancelWithAction(interrupt): %v", err)
+	}
+	affected := map[string]bool{}
+	for _, r := range results {
+		affected[r.RunID] = true
+	}
+	if !affected[pendingMatch] || !affected[runningMatch] {
+		t.Errorf("results = %+v, want pendingMatch and runningMatch present", results)
+	}
+	if affected[pendingMismatch] || affected[runningMismatch] {
+		t.Errorf("results = %+v, mismatch-thread runs must not be affected", results)
+	}
+
+	// Matching thread: pending run transitions to interrupted; running run
+	// gets cancel_requested_at set.
+	r, err := store.Get(ctx, pendingMatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMatch: %v", err)
+	}
+	if r.Status != "interrupted" {
+		t.Errorf("pendingMatch status = %q, want interrupted", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMatch) == nil {
+		t.Error("runningMatch cancel_requested_at not set, want set")
+	}
+
+	// Non-matching thread: both runs left completely untouched.
+	r, err = store.Get(ctx, pendingMismatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMismatch: %v", err)
+	}
+	if r.Status != "pending" {
+		t.Errorf("pendingMismatch status = %q, want still pending", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, pendingMismatch) != nil {
+		t.Error("pendingMismatch cancel_requested_at set, want untouched")
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMismatch) != nil {
+		t.Error("runningMismatch cancel_requested_at set, want untouched")
+	}
+}
+
+// TestStore_CancelWithAction_Rollback_AuthFilter proves the same
+// EXISTS-correlated auth filter is honored in both the pending "rollback"
+// DELETE and the running-runs UPDATE: a run on a matching thread is affected,
+// a run on a non-matching thread survives untouched.
+func TestStore_CancelWithAction_Rollback_AuthFilter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-cancel-auth-rb", nil)
+
+	matchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"alice"}`))
+	mismatchThread := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"owner":"bob"}`))
+
+	pendingMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "pending")
+	pendingMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "pending")
+	runningMatch := testdb.MustInsertRun(t, ctx, pool, matchThread, aID, "running")
+	runningMismatch := testdb.MustInsertRun(t, ctx, pool, mismatchThread, aID, "running")
+
+	filters := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	results, err := store.CancelWithAction(ctx,
+		[]string{pendingMatch, pendingMismatch, runningMatch, runningMismatch},
+		"", "rollback", filters)
+	if err != nil {
+		t.Fatalf("CancelWithAction(rollback): %v", err)
+	}
+	affected := map[string]bool{}
+	for _, r := range results {
+		affected[r.RunID] = true
+	}
+	if !affected[pendingMatch] || !affected[runningMatch] {
+		t.Errorf("results = %+v, want pendingMatch and runningMatch present", results)
+	}
+	if affected[pendingMismatch] || affected[runningMismatch] {
+		t.Errorf("results = %+v, mismatch-thread runs must not be affected", results)
+	}
+
+	// Matching thread: pending run is hard-deleted; running run gets
+	// cancel_requested_at set.
+	if _, err := store.Get(ctx, pendingMatch, "", nil); !errors.Is(err, runs.ErrNotFound) {
+		t.Errorf("pendingMatch after rollback: want ErrNotFound, got %v", err)
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMatch) == nil {
+		t.Error("runningMatch cancel_requested_at not set, want set")
+	}
+
+	// Non-matching thread: both runs survive completely untouched.
+	r, err := store.Get(ctx, pendingMismatch, "", nil)
+	if err != nil {
+		t.Fatalf("Get pendingMismatch: %v", err)
+	}
+	if r.Status != "pending" {
+		t.Errorf("pendingMismatch status = %q, want still pending", r.Status)
+	}
+	if runCancelRequestedAt(t, ctx, pool, pendingMismatch) != nil {
+		t.Error("pendingMismatch cancel_requested_at set, want untouched")
+	}
+	if runCancelRequestedAt(t, ctx, pool, runningMismatch) != nil {
+		t.Error("runningMismatch cancel_requested_at set, want untouched")
 	}
 }
 
@@ -1095,7 +1534,7 @@ func TestCreate_UserID_InjectsIntoConfigurable(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1104,6 +1543,7 @@ func TestCreate_UserID_InjectsIntoConfigurable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create with UserID: %v", err)
 	}
+	r := res.Run
 	var kw struct {
 		Config struct {
 			Configurable map[string]any `json:"configurable"`
@@ -1128,7 +1568,7 @@ func TestCreate_UserID_Precedence(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
 	// Caller-provided kwargs.config.configurable.user_id takes precedence.
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{"config":{"configurable":{"user_id":"kwarg-user"}}}`),
@@ -1137,6 +1577,7 @@ func TestCreate_UserID_Precedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	r := res.Run
 	var kw struct {
 		Config struct {
 			Configurable map[string]any `json:"configurable"`
@@ -1162,7 +1603,7 @@ func TestCreate_UserID_FallsBackToRequest(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
 	// No kwargs.config.configurable.user_id, no thread/assistant config → fallback to UserID.
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1171,6 +1612,7 @@ func TestCreate_UserID_FallsBackToRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	r := res.Run
 	var kw struct {
 		Config struct {
 			Configurable map[string]any `json:"configurable"`
@@ -1194,7 +1636,7 @@ func TestCreate_AssistantID_SetdefaultInMetadata(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1203,6 +1645,7 @@ func TestCreate_AssistantID_SetdefaultInMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	r := res.Run
 	var meta map[string]any
 	if err := json.Unmarshal(r.Metadata, &meta); err != nil {
 		t.Fatalf("unmarshal metadata: %v", err)
@@ -1223,7 +1666,7 @@ func TestCreate_AssistantID_CallerWins(t *testing.T) {
 	aID, thID := seedRunFixtures(t, ctx, pool)
 
 	callerMeta := []byte(`{"assistant_id":"custom-assistant-id"}`)
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    thID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1232,6 +1675,7 @@ func TestCreate_AssistantID_CallerWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	r := res.Run
 	var meta map[string]any
 	if err := json.Unmarshal(r.Metadata, &meta); err != nil {
 		t.Fatalf("unmarshal metadata: %v", err)
@@ -1275,7 +1719,7 @@ func TestCreate_IfNotExists_Create_AutoCreatesThread(t *testing.T) {
 	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-autocreate", nil)
 
 	newThreadID := "dddddddd-cccc-cccc-cccc-cccccccccccc"
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    newThreadID,
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1284,19 +1728,21 @@ func TestCreate_IfNotExists_Create_AutoCreatesThread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create with if_not_exists=create: %v", err)
 	}
+	r := res.Run
 	if r.ThreadID != newThreadID {
 		t.Errorf("run.ThreadID = %q, want %q", r.ThreadID, newThreadID)
 	}
 
-	// Verify thread was actually created.
-	var exists bool
+	// Verify thread was actually created, with status='busy' (2b — ops.py:1530,
+	// not 'idle': a thread auto-created to host a run is immediately busy).
+	var threadStatus string
 	if err := pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM thread WHERE thread_id = $1::uuid)`, newThreadID,
-	).Scan(&exists); err != nil {
+		`SELECT status FROM thread WHERE thread_id = $1::uuid`, newThreadID,
+	).Scan(&threadStatus); err != nil {
 		t.Fatalf("check thread exists: %v", err)
 	}
-	if !exists {
-		t.Error("thread was not auto-created by if_not_exists=create")
+	if threadStatus != "busy" {
+		t.Errorf("auto-created thread status = %q, want busy (2b)", threadStatus)
 	}
 }
 
@@ -1311,7 +1757,7 @@ func TestCreate_IfNotExists_Create_NoThreadID_GeneratesThread(t *testing.T) {
 	store, pool := newTestStore(t, ctx)
 	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-genthread", nil)
 
-	r, err := store.Create(ctx, runs.CreateRunInput{
+	res, err := store.Create(ctx, runs.CreateRunInput{
 		ThreadID:    "", // no thread_id provided
 		AssistantID: aID,
 		KwargsJSON:  []byte(`{}`),
@@ -1320,6 +1766,7 @@ func TestCreate_IfNotExists_Create_NoThreadID_GeneratesThread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create with no thread_id and if_not_exists=create: %v", err)
 	}
+	r := res.Run
 	if r.ThreadID == "" {
 		t.Error("expected a generated thread_id, got empty")
 	}
@@ -1333,6 +1780,42 @@ func TestCreate_IfNotExists_Create_NoThreadID_GeneratesThread(t *testing.T) {
 	}
 	if !exists {
 		t.Errorf("auto-generated thread %q was not created", r.ThreadID)
+	}
+}
+
+// TestCreate_EmptyThreadID_AutoCreatesEvenWithoutIfNotExistsCreate verifies
+// 2b: ops.py:1527-1560 auto-creates the thread when thread_id is None OR
+// if_not_exists == "create" — either condition alone is sufficient. Here
+// IfNotExists is left at its zero value (REJECT_RUN_IF_THREAD_NOT_EXISTS);
+// only the empty ThreadID should still force auto-creation.
+func TestCreate_EmptyThreadID_AutoCreatesEvenWithoutIfNotExistsCreate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-empty-threadid", nil)
+
+	res, err := store.Create(ctx, runs.CreateRunInput{
+		ThreadID:    "",
+		AssistantID: aID,
+		KwargsJSON:  []byte(`{}`),
+		IfNotExists: 0, // REJECT_RUN_IF_THREAD_NOT_EXISTS — must not matter here.
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Create with empty thread_id (2b): %v", err)
+	}
+	if res.Run.ThreadID == "" {
+		t.Fatal("expected a generated thread_id, got empty")
+	}
+	var threadStatus string
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM thread WHERE thread_id = $1::uuid`, res.Run.ThreadID,
+	).Scan(&threadStatus); err != nil {
+		t.Fatalf("check thread exists: %v", err)
+	}
+	if threadStatus != "busy" {
+		t.Errorf("auto-created thread status = %q, want busy (2b)", threadStatus)
 	}
 }
 

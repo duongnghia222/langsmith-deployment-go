@@ -51,40 +51,41 @@ type Run struct {
 	Metadata          []byte
 	LeaseGeneration   int64
 	RunAfter          *time.Time // NULL when after_seconds was 0; deferred-start runs skipped by Next until reached
+	Attempt           int64      // (2k) number of times Next has claimed this run; distinct from LeaseGeneration fencing
+	EncryptionContext []byte     // NULL when no context was recorded at create time (fix round 1, finding 2)
 }
 
-// runCols is the SELECT projection for all Run fields.
-const runCols = `run_id::text, COALESCE(thread_id::text,''), COALESCE(assistant_id::text,''),
-	COALESCE(status,''),
-	COALESCE(kwargs, '{}'::jsonb)::text::bytea,
-	COALESCE(multitask_strategy, ''),
-	created_at, updated_at,
-	COALESCE(metadata, '{}'::jsonb)::text::bytea,
-	COALESCE(lease_generation, 0),
-	run_after`
+// runCols is the SELECT projection for all Run fields, qualified with the
+// run. prefix: several callers now JOIN thread, which has same-named
+// columns (status, created_at, updated_at, metadata, thread_id) that would
+// otherwise be ambiguous.
+const runCols = `run.run_id::text, COALESCE(run.thread_id::text,''), COALESCE(run.assistant_id::text,''),
+	COALESCE(run.status,''),
+	COALESCE(run.kwargs, '{}'::jsonb)::text::bytea,
+	COALESCE(run.multitask_strategy, ''),
+	run.created_at, run.updated_at,
+	COALESCE(run.metadata, '{}'::jsonb)::text::bytea,
+	COALESCE(run.lease_generation, 0),
+	run.run_after,
+	COALESCE(run.attempt, 0),
+	run.encryption_context::text::bytea`
 
 // Get returns the run with the given UUID string, optionally scoped to a
-// thread, and applying auth filters to the metadata column.
+// thread, and applying auth filters to the thread's metadata column.
+// Mirrors ops.py:1681-1710, which always JOINs thread USING (thread_id) and
+// filters on thread.metadata (table_alias="thread").
 // Returns ErrNotFound if there is no matching row.
 func (s *Store) Get(ctx context.Context, runID, threadID string, filters []*coreapi.AuthFilter) (*Run, error) {
-	authSQL, args, err := auth.ApplyToQuery(filters, "metadata", 2)
-	if err != nil {
-		return nil, fmt.Errorf("auth: %w", err)
-	}
-
-	extra := prefixAnd(authSQL)
 	if threadID != "" {
-		// thread_id filter shifts the auth arg index by one extra placeholder.
-		// Re-build auth with offset adjusted for the two base args (run_id + thread_id).
-		authSQL2, args2, err := auth.ApplyToQuery(filters, "metadata", 3)
+		authSQL, args, err := auth.ApplyToQuery(filters, "thread.metadata", 3)
 		if err != nil {
 			return nil, fmt.Errorf("auth: %w", err)
 		}
 		q := fmt.Sprintf(
-			`SELECT %s FROM run WHERE run_id = $1::uuid AND thread_id = $2::uuid%s`,
-			runCols, prefixAnd(authSQL2),
+			`SELECT %s FROM run JOIN thread USING (thread_id) WHERE run.run_id = $1::uuid AND run.thread_id = $2::uuid%s`,
+			runCols, prefixAnd(authSQL),
 		)
-		allArgs := append([]any{runID, threadID}, args2...)
+		allArgs := append([]any{runID, threadID}, args...)
 		row := s.pool.QueryRow(ctx, q, allArgs...)
 		var r Run
 		if err := scanRun(row, &r); err != nil {
@@ -96,7 +97,11 @@ func (s *Store) Get(ctx context.Context, runID, threadID string, filters []*core
 		return &r, nil
 	}
 
-	q := fmt.Sprintf(`SELECT %s FROM run WHERE run_id = $1::uuid%s`, runCols, extra)
+	authSQL, args, err := auth.ApplyToQuery(filters, "thread.metadata", 2)
+	if err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+	q := fmt.Sprintf(`SELECT %s FROM run JOIN thread USING (thread_id) WHERE run.run_id = $1::uuid%s`, runCols, prefixAnd(authSQL))
 	allArgs := append([]any{runID}, args...)
 	row := s.pool.QueryRow(ctx, q, allArgs...)
 	var r Run
@@ -118,47 +123,55 @@ type SearchInput struct {
 	Offset         uint64
 }
 
-// whereArgs builds the WHERE fragment and argument slice shared by Search and Count.
-// idx is the starting $N placeholder index (1-based). It returns the complete WHERE
-// clause string (always non-empty — at minimum "TRUE"), the bound args, the next
-// free placeholder index, and any error from auth filter expansion.
-func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, []any, int, error) {
+// whereArgs builds the JOIN and WHERE fragments shared by Search and Count.
+// idx is the starting $N placeholder index (1-based). It returns the JOIN
+// fragment (empty, or "JOIN thread USING (thread_id)"), the complete WHERE
+// clause string (always non-empty — at minimum "TRUE"), the bound args, the
+// next free placeholder index, and any error from auth filter expansion.
+//
+// (ops.py:1928-1931) Auth filters apply to thread.metadata; thread is only
+// joined when filters are present, so a run whose thread was deleted is
+// excluded exactly when ops.py's INNER JOIN would exclude it (no behavior
+// change when no filters are given).
+func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (string, string, []any, int, error) {
 	args := []any{}
 	wheres := []string{"TRUE"}
 	idx := 1
 
 	if in.ThreadID != "" {
-		wheres = append(wheres, fmt.Sprintf("thread_id = $%d::uuid", idx))
+		wheres = append(wheres, fmt.Sprintf("run.thread_id = $%d::uuid", idx))
 		args = append(args, in.ThreadID)
 		idx++
 	}
 	if len(in.Statuses) > 0 {
-		wheres = append(wheres, fmt.Sprintf("status = ANY($%d::text[])", idx))
+		wheres = append(wheres, fmt.Sprintf("run.status = ANY($%d::text[])", idx))
 		args = append(args, in.Statuses)
 		idx++
 	}
 	if len(in.MetadataFilter) > 0 {
-		wheres = append(wheres, fmt.Sprintf("metadata @> $%d::jsonb", idx))
+		wheres = append(wheres, fmt.Sprintf("run.metadata @> $%d::jsonb", idx))
 		args = append(args, in.MetadataFilter)
 		idx++
 	}
 
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", idx)
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", idx)
 	if err != nil {
-		return "", nil, 0, fmt.Errorf("auth: %w", err)
+		return "", "", nil, 0, fmt.Errorf("auth: %w", err)
 	}
+	join := ""
 	if authSQL != "" {
+		join = "JOIN thread USING (thread_id)"
 		wheres = append(wheres, authSQL)
 		args = append(args, authArgs...)
 		idx += len(authArgs)
 	}
 
-	return strings.Join(wheres, " AND "), args, idx, nil
+	return join, strings.Join(wheres, " AND "), args, idx, nil
 }
 
 // Search returns runs matching the given criteria, ordered by created_at DESC with run_id tiebreaker.
 func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.AuthFilter) ([]*Run, error) {
-	where, args, idx, err := whereArgs(in, filters)
+	join, where, args, idx, err := whereArgs(in, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +181,9 @@ func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.A
 		limit = 100
 	}
 	q := fmt.Sprintf(
-		`SELECT %s FROM run WHERE %s ORDER BY created_at DESC, run_id LIMIT $%d OFFSET $%d`,
+		`SELECT %s FROM run %s WHERE %s ORDER BY run.created_at DESC, run.run_id LIMIT $%d OFFSET $%d`,
 		runCols,
+		join,
 		where,
 		idx, idx+1,
 	)
@@ -194,11 +208,11 @@ func (s *Store) Search(ctx context.Context, in SearchInput, filters []*coreapi.A
 
 // Count returns the number of runs matching the given criteria.
 func (s *Store) Count(ctx context.Context, in SearchInput, filters []*coreapi.AuthFilter) (uint64, error) {
-	where, args, _, err := whereArgs(in, filters)
+	join, where, args, _, err := whereArgs(in, filters)
 	if err != nil {
 		return 0, err
 	}
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM run WHERE %s`, where)
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM run %s WHERE %s`, join, where)
 	var n uint64
 	if err := s.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
 		return 0, err
@@ -285,6 +299,8 @@ func scanRun(row pgx.Row, r *Run) error {
 		&r.Metadata,
 		&r.LeaseGeneration,
 		&r.RunAfter,
+		&r.Attempt,
+		&r.EncryptionContext,
 	)
 }
 
@@ -416,6 +432,13 @@ type CreateRunInput struct {
 	MultitaskStrategy string // reject | rollback | interrupt | enqueue
 	AfterSeconds      uint64 // 0 → run immediately (run_after stays NULL)
 
+	// (fix round 1, finding 2) encryption_context, protojson-marshaled by
+	// service.Create via jsonbutil.Marshal. nil → column stays NULL (no
+	// context was present on the request), never defaulted to "{}" — Next()
+	// must be able to tell "absent" from "present but empty" apart (mirrors
+	// crons.py's next() semantics that extract_encryption_context now matches).
+	EncryptionContext []byte
+
 	// (item 1) user_id injected into kwargs.config.configurable.user_id.
 	// Precedence: request.user_id < thread.config > assistant.config (ops.py:1605-1610 COALESCE).
 	UserID string // optional; empty → no injection (COALESCE yields NULL)
@@ -424,6 +447,16 @@ type CreateRunInput struct {
 	// thread is auto-created from the assistant's config (ops.py:1527-1558 CTE).
 	// Zero value (0) = REJECT_RUN_IF_THREAD_NOT_EXISTS.
 	IfNotExists int32 // coreapi.CreateRunBehavior enum value
+}
+
+// CreateResult is the return value of Create. InflightRunIDs holds the IDs of
+// runs that were pending/running on the thread at create time under a
+// "rollback"/"interrupt" multitask strategy (ops.py:1834-1899 semantics) —
+// Create itself does not mutate or signal them; the caller (service.Create)
+// applies the same action Cancel would (2d).
+type CreateResult struct {
+	Run            *Run
+	InflightRunIDs []string
 }
 
 // Create inserts a new run row, applying the multitask strategy logic inside a
@@ -437,14 +470,15 @@ type CreateRunInput struct {
 //     > assistant.config.configurable.user_id > request.user_id
 //   - (item 2) metadata.assistant_id is set via setdefault semantics (ops.py:1502):
 //     caller-provided metadata.assistant_id wins; otherwise assistant_id is injected.
-//   - (item 3) if_not_exists=CREATE_THREAD_IF_THREAD_NOT_EXISTS auto-creates the
-//     thread from assistant config/metadata if it does not exist (ops.py:1527-1558).
+//   - (item 3) if_not_exists=CREATE_THREAD_IF_THREAD_NOT_EXISTS, OR an empty
+//     ThreadID, auto-creates the thread from assistant config/metadata if it
+//     does not exist (ops.py:1527-1560).
 func (s *Store) Create(
 	ctx context.Context,
 	in CreateRunInput,
 	threadFilters []*coreapi.AuthFilter,
 	assistantFilters []*coreapi.AuthFilter,
-) (*Run, error) {
+) (*CreateResult, error) {
 	if in.Status == "" {
 		in.Status = "pending"
 	}
@@ -458,9 +492,25 @@ func (s *Store) Create(
 		in.MultitaskStrategy = "reject"
 	}
 
-	// (item 3) Determine if thread auto-creation is requested.
-	// CreateRunBehavior_CREATE_THREAD_IF_THREAD_NOT_EXISTS = 1
-	createThreadIfMissing := in.IfNotExists == 1
+	// (item 3 / 2b) Determine if thread auto-creation is requested.
+	// CreateRunBehavior_CREATE_THREAD_IF_THREAD_NOT_EXISTS = 1, OR an empty
+	// thread_id (ops.py:1527-1560: thread is auto-created when thread_id is
+	// None *or* if_not_exists == "create").
+	createThreadIfMissing := in.IfNotExists == 1 || in.ThreadID == ""
+
+	// (2c) Request config extracted once from kwargs.config, reused both for
+	// auto-creating a thread and for updating an existing thread below.
+	requestConfig := func() []byte {
+		var kw map[string]any
+		if err2 := json.Unmarshal(in.KwargsJSON, &kw); err2 == nil {
+			if cfg, ok := kw["config"]; ok {
+				if b, err3 := json.Marshal(cfg); err3 == nil {
+					return b
+				}
+			}
+		}
+		return []byte(`{}`)
+	}()
 
 	// Generate a thread ID if none was provided (Python: thread_id or uuid4()).
 	threadID := in.ThreadID
@@ -511,14 +561,15 @@ func (s *Store) Create(
 		if !createThreadIfMissing {
 			return nil, ErrNotFound
 		}
-		// (item 3) Auto-create the thread (ops.py:1527-1548 inserted_thread CTE).
+		// (item 3 / 2b) Auto-create the thread (ops.py:1527-1548 inserted_thread CTE).
 		// Thread metadata is seeded with graph_id+assistant_id from the assistant row.
 		// Thread config is seeded from assistant config merged with request config.
+		// Status is 'busy' (ops.py:1530), not 'idle' — the thread is about to host a run.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO thread (thread_id, status, metadata, config, created_at, updated_at)
 			SELECT
 				$1::uuid,
-				'idle',
+				'busy',
 				jsonb_build_object(
 					'graph_id',      a.graph_id,
 					'assistant_id',  a.assistant_id
@@ -536,18 +587,7 @@ func (s *Store) Create(
 			ON CONFLICT (thread_id) DO NOTHING`,
 			threadID,
 			in.Metadata,
-			// pass request config from kwargs (ops.py:1569 params["config"])
-			func() []byte {
-				var kw map[string]any
-				if err2 := json.Unmarshal(in.KwargsJSON, &kw); err2 == nil {
-					if cfg, ok := kw["config"]; ok {
-						if b, err3 := json.Marshal(cfg); err3 == nil {
-							return b
-						}
-					}
-				}
-				return []byte(`{}`)
-			}(),
+			requestConfig,
 			in.AssistantID,
 		); err != nil {
 			return nil, fmt.Errorf("auto-create thread: %w", err)
@@ -557,7 +597,39 @@ func (s *Store) Create(
 	// Store effective threadID back for multitask checks below.
 	in.ThreadID = threadID
 
-	// Multitask strategy: act on any existing inflight runs.
+	// (2c) Update an existing thread's metadata/config/status on run create
+	// (ops.py:1608-1660 updated_thread CTE). The `status != 'busy'` guard makes
+	// this a no-op for threads just auto-created above (already 'busy').
+	if _, err := tx.Exec(ctx, `
+		UPDATE thread SET
+			metadata = jsonb_set(
+				jsonb_set(thread.metadata, '{graph_id}', to_jsonb(assistant.graph_id)),
+				'{assistant_id}',
+				to_jsonb(assistant.assistant_id)
+			),
+			config = assistant.config
+				|| thread.config
+				|| $3::jsonb
+				|| jsonb_build_object(
+					'configurable',
+						COALESCE(assistant.config -> 'configurable', '{}'::jsonb) ||
+						COALESCE(thread.config -> 'configurable', '{}'::jsonb) ||
+						COALESCE($3::jsonb -> 'configurable', '{}'::jsonb)
+					),
+			status = 'busy'
+		FROM assistant
+		WHERE thread.thread_id = $1::uuid
+		  AND assistant.assistant_id = $2::uuid
+		  AND thread.status != 'busy'`,
+		in.ThreadID, in.AssistantID, requestConfig,
+	); err != nil {
+		return nil, fmt.Errorf("update thread on run create: %w", err)
+	}
+
+	// (2d) Multitask strategy: capture (without mutating) any existing inflight
+	// runs so the caller (service.Create) can apply the same action Cancel
+	// would (interrupt/rollback), including publishing Redis signals.
+	var inflightIDs []string
 	switch in.MultitaskStrategy {
 	case "reject":
 		var inflight bool
@@ -571,12 +643,23 @@ func (s *Store) Create(
 			return nil, ErrInflight
 		}
 	case "rollback", "interrupt":
-		// Mark pending/running runs as interrupted and set cancel_requested_at.
-		if _, err := tx.Exec(ctx,
-			`UPDATE run SET cancel_requested_at = now(), status = 'interrupted', updated_at = now()
-			 WHERE thread_id = $1::uuid AND status IN ('pending', 'running')`,
+		rows, err := tx.Query(ctx,
+			`SELECT run_id::text FROM run WHERE thread_id = $1::uuid AND status IN ('pending', 'running')`,
 			in.ThreadID,
-		); err != nil {
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			inflightIDs = append(inflightIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
 	case "enqueue":
@@ -599,19 +682,36 @@ func (s *Store) Create(
 	//   $7::jsonb already carries caller metadata; we inject assistant_id only when
 	//   the caller did not provide it, using jsonb_build_object || $7 so caller wins.
 	insertArgs := []any{
-		in.RunID,    // $1 — empty string ⇒ generate
-		in.ThreadID, // $2
-		in.AssistantID, // $3
-		in.Status,      // $4
-		in.KwargsJSON,  // $5
+		in.RunID,             // $1 — empty string ⇒ generate
+		in.ThreadID,          // $2
+		in.AssistantID,       // $3
+		in.Status,            // $4
+		in.KwargsJSON,        // $5
 		in.MultitaskStrategy, // $6
 		in.Metadata,          // $7
 		in.UserID,            // $8 — user_id fallback (item 1)
 	}
+	// (fix round 1, finding 2) encryption_context: nullable, no COALESCE —
+	// mirrors the EndTime/OnRunCompleted optional-column idiom in
+	// crons/store.go's Create(). Appended before the AfterSeconds arg so that
+	// AfterSeconds's dynamic $N numbering (computed from len(insertArgs))
+	// shifts automatically.
+	encCtxSQL := "NULL"
+	if in.EncryptionContext != nil {
+		insertArgs = append(insertArgs, in.EncryptionContext)
+		encCtxSQL = fmt.Sprintf("$%d::jsonb", len(insertArgs))
+	}
 	runAfterExpr := "NULL"
+	// (2n) created_at defaults to now(); when after_seconds > 0 both run_after
+	// and created_at are pushed to the same future instant (ops.py:1573 sets
+	// created_at from the deferred start time). Reusing the identical
+	// expression/param for both columns guarantees equal values: now() is
+	// stable within a single statement/transaction in Postgres.
+	createdAtExpr := "now()"
 	if in.AfterSeconds > 0 {
 		nextArg := len(insertArgs) + 1
 		runAfterExpr = fmt.Sprintf("(now() + ($%d::bigint * interval '1 second'))", nextArg)
+		createdAtExpr = runAfterExpr
 		insertArgs = append(insertArgs, int64(in.AfterSeconds))
 	}
 	q := fmt.Sprintf(
@@ -620,7 +720,7 @@ func (s *Store) Create(
 		)
 		INSERT INTO run (
 			run_id, thread_id, assistant_id, status, kwargs, multitask_strategy, metadata,
-			run_after, created_at, updated_at
+			encryption_context, run_after, created_at, updated_at
 		)
 		SELECT
 			new_id.run_id,
@@ -656,13 +756,16 @@ func (s *Store) Create(
 			$6,
 			jsonb_build_object('assistant_id', a.assistant_id::text) || $7::jsonb,
 			%s,
-			now(),
+			%s,
+			%s,
 			now()
 		FROM new_id, assistant a, thread t
 		WHERE a.assistant_id = $3::uuid
 		  AND t.thread_id    = $2::uuid
 		RETURNING %s`,
+		encCtxSQL,
 		runAfterExpr,
+		createdAtExpr,
 		runCols,
 	)
 	var r Run
@@ -672,7 +775,7 @@ func (s *Store) Create(
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &r, nil
+	return &CreateResult{Run: &r, InflightRunIDs: inflightIDs}, nil
 }
 
 // Delete removes the run matching runID (optionally scoped to threadID + auth filters).
@@ -685,16 +788,21 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 	var q string
 	var args []any
 	if threadID != "" {
-		authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", 3)
+		authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", 3)
 		if err != nil {
 			return "", fmt.Errorf("auth: %w", err)
+		}
+		// (ops.py:1726-1732) thread is only joined when filter_params is non-empty.
+		join := ""
+		if authSQL != "" {
+			join = "JOIN thread USING (thread_id)"
 		}
 		// (item 4) CTE: first select the run, then delete orphaned checkpoint_writes
 		// for the run's checkpoints, then delete the run row itself.
 		// ops.py:1736-1760: selected → del_checkpoint_writes → DELETE FROM run.
 		q = fmt.Sprintf(`
 			WITH selected AS (
-				SELECT run_id FROM run
+				SELECT run_id FROM run %s
 				WHERE run_id = $1::uuid AND thread_id = $2::uuid%s
 			),
 			del_checkpoint_writes AS (
@@ -708,18 +816,22 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 			)
 			DELETE FROM run USING selected WHERE run.run_id = selected.run_id
 			RETURNING run.run_id::text`,
-			prefixAnd(authSQL),
+			join, prefixAnd(authSQL),
 		)
 		args = append([]any{runID, threadID}, authArgs...)
 	} else {
-		authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", 2)
+		authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", 2)
 		if err != nil {
 			return "", fmt.Errorf("auth: %w", err)
+		}
+		join := ""
+		if authSQL != "" {
+			join = "JOIN thread USING (thread_id)"
 		}
 		// (item 4) Same CTE without thread_id scope.
 		q = fmt.Sprintf(`
 			WITH selected AS (
-				SELECT run_id FROM run
+				SELECT run_id FROM run %s
 				WHERE run_id = $1::uuid%s
 			),
 			del_checkpoint_writes AS (
@@ -733,7 +845,7 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 			)
 			DELETE FROM run USING selected WHERE run.run_id = selected.run_id
 			RETURNING run.run_id::text`,
-			prefixAnd(authSQL),
+			join, prefixAnd(authSQL),
 		)
 		args = append([]any{runID}, authArgs...)
 	}
@@ -753,6 +865,13 @@ func (s *Store) Delete(ctx context.Context, runID, threadID string, filters []*c
 type CancelResult struct {
 	RunID   string
 	Deleted bool
+	// Terminal is true when this row just transitioned to a terminal run
+	// status as a result of this call (rollback-delete, or interrupt on a
+	// pending row). It is false for the "running" branch, where only
+	// cancel_requested_at was set and the worker has yet to transition the
+	// run — the caller uses this to decide whether to publish to the run's
+	// terminal-done channel (2f-ii).
+	Terminal bool
 }
 
 // Cancel implements the Python ops.py:1797-1877 cancel semantics per run:
@@ -760,8 +879,9 @@ type CancelResult struct {
 //   - pending + interrupt → status = 'interrupted', cancel_requested_at = now()
 //   - running  (any)      → only cancel_requested_at = now() (worker transitions)
 //
-// Auth filters are applied to run.metadata. Returns the list of CancelResults
-// for matched runs so the caller can publish Redis signals for affected run IDs.
+// Auth filters are applied to the run's thread metadata (ops.py:1824-1832).
+// Returns the list of CancelResults for matched runs so the caller can
+// publish Redis signals for affected run IDs.
 func (s *Store) Cancel(ctx context.Context, runIDs []string, threadID string, filters []*coreapi.AuthFilter) ([]string, error) {
 	results, err := s.CancelWithAction(ctx, runIDs, threadID, "interrupt", filters)
 	if err != nil {
@@ -796,12 +916,19 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 		baseArgs = append(baseArgs, threadID)
 		baseWheres = append(baseWheres, fmt.Sprintf("thread_id = $%d::uuid", len(baseArgs)))
 	}
-	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", len(baseArgs)+1)
+	// (ops.py:1824-1832) Auth filters apply to thread.metadata; thread would be
+	// JOINed only when filters are present. run/UPDATE/DELETE targets can't
+	// carry an extra JOIN, so we express the same INNER-JOIN exclusion via a
+	// correlated EXISTS against thread (thread_id is thread's PK, so at most
+	// one matching row — same semantics as the JOIN).
+	authSQL, authArgs, err := auth.ApplyToQuery(filters, "thread.metadata", len(baseArgs)+1)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	if authSQL != "" {
-		baseWheres = append(baseWheres, authSQL)
+		baseWheres = append(baseWheres, fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM thread WHERE thread.thread_id = run.thread_id AND %s)", authSQL,
+		))
 		baseArgs = append(baseArgs, authArgs...)
 	}
 	baseArgs = append(baseArgs, runIDs)
@@ -829,7 +956,7 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 				rows.Close()
 				return nil, err
 			}
-			out = append(out, CancelResult{RunID: id, Deleted: true})
+			out = append(out, CancelResult{RunID: id, Deleted: true, Terminal: true})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -852,7 +979,7 @@ func (s *Store) CancelWithAction(ctx context.Context, runIDs []string, threadID,
 				rows.Close()
 				return nil, err
 			}
-			out = append(out, CancelResult{RunID: id, Deleted: false})
+			out = append(out, CancelResult{RunID: id, Deleted: false, Terminal: true})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -946,19 +1073,16 @@ func isTerminalStatus(statusText string) bool {
 	return false
 }
 
-// MarkDone transitions a run to its terminal status and clears the lease columns.
-// If resumable is true the run is marked 'interrupted', otherwise 'success'.
-func (s *Store) MarkDone(ctx context.Context, runID string, resumable bool) error {
-	termStatus := "success"
-	if resumable {
-		termStatus = "interrupted"
-	}
+// MarkDone releases a run's lease without touching its status (ops.py:1417-1437,
+// 2a). The worker/graph execution path is the sole owner of the terminal status
+// transition (via SetStatus); MarkDone must not overwrite it, whatever it is.
+func (s *Store) MarkDone(ctx context.Context, runID string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE run
-		 SET status = $2, updated_at = now(),
+		 SET updated_at = now(),
 		     lease_holder_id = NULL, lease_expires_at = NULL
 		 WHERE run_id = $1::uuid`,
-		runID, termStatus,
+		runID,
 	)
 	return err
 }
@@ -971,7 +1095,9 @@ type ClaimedRun struct {
 
 // Next claims up to limit pending runs using SELECT … FOR UPDATE SKIP LOCKED,
 // sets their status to 'running', stamps lease_expires_at = now() + 5 minutes,
-// and increments lease_generation. Returns the claimed runs with their attempt count.
+// and increments lease_generation. Returns the claimed runs with their attempt
+// count (2k: attempt is the number of times Next has claimed the run — distinct
+// from lease_generation, which Sweep also bumps as a zombie-fencing token).
 func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 	if limit == 0 {
 		limit = 1
@@ -1027,11 +1153,16 @@ func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 		ids[i] = r.RunID
 	}
 	// (item 6) Use s.leaseTTL (from LSD_LEASE_TTL_SECONDS) instead of hardcoded 5 minutes.
+	// (2k) attempt counts claims (bumped here, on every successful Next claim);
+	// lease_generation is a separate fencing token also bumped by Sweep, which
+	// must NOT bump attempt (a swept-and-reclaimed run has been claimed twice,
+	// not three times).
 	if _, err := tx.Exec(ctx,
 		`UPDATE run
 		 SET status = 'running',
 		     lease_expires_at  = now() + ($2::int * INTERVAL '1 second'),
 		     lease_generation  = lease_generation + 1,
+		     attempt           = attempt + 1,
 		     updated_at        = now()
 		 WHERE run_id = ANY($1::uuid[])`,
 		ids, s.leaseTTL,
@@ -1049,7 +1180,7 @@ func (s *Store) Next(ctx context.Context, limit uint64) ([]*ClaimedRun, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, &ClaimedRun{Run: updated, Attempt: uint64(updated.LeaseGeneration)})
+		out = append(out, &ClaimedRun{Run: updated, Attempt: uint64(updated.Attempt)})
 	}
 	return out, nil
 }

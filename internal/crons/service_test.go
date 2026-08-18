@@ -6,6 +6,7 @@ import (
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumcronorc "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cron_on_run_completed"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/crons"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
@@ -224,9 +225,10 @@ func TestService_OnRunCompletedRoundTrip(t *testing.T) {
 }
 
 // TestService_Search_ThreadFilters verifies that thread_filters are accepted and
-// correctly constrain results via an INNER JOIN with the thread table.
-// Crons that have a matching thread pass; crons with no thread (NULL thread_id) are
-// excluded by the INNER JOIN when thread_filters is set.
+// correctly constrain results via a LEFT JOIN with the thread table.
+// Crons with a matching thread pass; crons with no thread (NULL thread_id) are
+// exempt from thread_filters entirely (ops.py:2440-2442: "cron.thread_id IS
+// NULL OR (...)") and are therefore ALSO included.
 func TestService_Search_ThreadFilters(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -244,24 +246,25 @@ func TestService_Search_ThreadFilters(t *testing.T) {
 	tID2 := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"role":"user"}`))
 	testdb.MustInsertCronWithThread(t, ctx, pool, aID, tID2, "0 * * * *")
 
-	// Cron with no thread — excluded by INNER JOIN.
+	// Cron with no thread — exempt from thread_filters, always included.
 	testdb.MustInsertCron(t, ctx, pool, aID, "0 0 * * *")
 
 	resp, err := svc.Search(ctx, &coreapi.SearchCronsRequest{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "admin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Search with thread_filters: %v", err)
 	}
-	if len(resp.GetCrons()) != 1 {
-		t.Errorf("len(crons) = %d, want 1", len(resp.GetCrons()))
+	if len(resp.GetCrons()) != 2 {
+		t.Errorf("len(crons) = %d, want 2 (matching thread + no-thread cron)", len(resp.GetCrons()))
 	}
 }
 
 // TestService_Count_ThreadFilters verifies that thread_filters are accepted and
-// correctly constrain the count via an INNER JOIN with the thread table.
+// correctly constrain the count via a LEFT JOIN with the thread table, exempting
+// no-thread crons from the filter (ops.py:2440-2442).
 func TestService_Count_ThreadFilters(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -279,19 +282,19 @@ func TestService_Count_ThreadFilters(t *testing.T) {
 	tID2 := testdb.MustInsertThreadWithMeta(t, ctx, pool, []byte(`{"role":"user"}`))
 	testdb.MustInsertCronWithThread(t, ctx, pool, aID, tID2, "0 * * * *")
 
-	// Cron with no thread — excluded by INNER JOIN.
+	// Cron with no thread — exempt from thread_filters, always included.
 	testdb.MustInsertCron(t, ctx, pool, aID, "0 0 * * *")
 
 	resp, err := svc.Count(ctx, &coreapi.CountCronsRequest{
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: "admin"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "role", Match: `"admin"`}}},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Count with thread_filters: %v", err)
 	}
-	if resp.GetCount() != 1 {
-		t.Errorf("Count(thread_filters) = %d, want 1", resp.GetCount())
+	if resp.GetCount() != 2 {
+		t.Errorf("Count(thread_filters) = %d, want 2 (matching thread + no-thread cron)", resp.GetCount())
 	}
 }
 
@@ -368,6 +371,102 @@ func TestService_Next_ExcludesExpired(t *testing.T) {
 	}
 }
 
+// TestService_Create_EncryptionContextRoundTripsThroughNext is fix round 1,
+// finding 2: encryption_context must be persisted on Create and populated
+// back onto CronWithNow when Next() claims a due cron, so a later-claiming
+// scheduler tick (api/grpc/ops/crons.py's next()) can retrieve it.
+func TestService_Create_EncryptionContextRoundTripsThroughNext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "svc-enc-ctx-graph", nil)
+
+	ec := &encryption.EncryptionContext{Metadata: map[string][]byte{"tenant_id": []byte(`"abc"`)}}
+	created, err := svc.Create(ctx, &coreapi.CreateCronRequest{
+		Schedule:          "* * * * *",
+		Payload:           &coreapi.CronPayload{AssistantId: aID},
+		Enabled:           true,
+		EncryptionContext: ec,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cronID := created.GetCronId().GetValue()
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, cronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	resp, err := svc.Next(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var got *coreapi.CronWithNow
+	for _, cw := range resp.GetCrons() {
+		if cw.GetCron().GetCronId().GetValue() == cronID {
+			got = cw
+		}
+	}
+	if got == nil {
+		t.Fatalf("cron %s not returned by Next", cronID)
+	}
+	gotEC := got.GetEncryptionContext()
+	if gotEC == nil {
+		t.Fatal("CronWithNow.EncryptionContext = nil, want populated from the persisted column")
+	}
+	if string(gotEC.GetMetadata()["tenant_id"]) != `"abc"` {
+		t.Errorf("EncryptionContext.metadata[tenant_id] = %q, want %q", gotEC.GetMetadata()["tenant_id"], `"abc"`)
+	}
+}
+
+// TestService_Create_EncryptionContextAbsent_NextLeavesItUnset is fix round 1,
+// finding 2's absence case: a cron created without an encryption context must
+// come back from Next() with the field genuinely unset (nil), matching
+// finding 1's None-vs-empty-dict distinction on the Python side.
+func TestService_Create_EncryptionContextAbsent_NextLeavesItUnset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "svc-enc-ctx-absent-graph", nil)
+
+	created, err := svc.Create(ctx, &coreapi.CreateCronRequest{
+		Schedule: "* * * * *",
+		Payload:  &coreapi.CronPayload{AssistantId: aID},
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cronID := created.GetCronId().GetValue()
+	if _, err := pool.Exec(ctx,
+		`UPDATE cron SET next_run_date = now() - interval '1 second' WHERE cron_id = $1::uuid`, cronID,
+	); err != nil {
+		t.Fatalf("set next_run_date: %v", err)
+	}
+
+	resp, err := svc.Next(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	var got *coreapi.CronWithNow
+	for _, cw := range resp.GetCrons() {
+		if cw.GetCron().GetCronId().GetValue() == cronID {
+			got = cw
+		}
+	}
+	if got == nil {
+		t.Fatalf("cron %s not returned by Next", cronID)
+	}
+	if got.EncryptionContext != nil {
+		t.Errorf("CronWithNow.EncryptionContext = %v, want nil (unset)", got.EncryptionContext)
+	}
+}
+
 // TestService_Create_AuthFilters_NotFound verifies that Create with non-matching
 // assistant_filters returns codes.NotFound (ops.py:2279: "Thread not found or not authorized").
 func TestService_Create_AuthFilters_NotFound(t *testing.T) {
@@ -386,7 +485,7 @@ func TestService_Create_AuthFilters_NotFound(t *testing.T) {
 		},
 		Enabled: true,
 		AssistantFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "charlie"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"charlie"`}}},
 		},
 	})
 	if err == nil {
@@ -421,7 +520,7 @@ func TestService_Create_MissingThread_NotFound(t *testing.T) {
 		ThreadId: &coreapi.UUID{Value: nonexistentThread},
 		Enabled:  true,
 		ThreadFilters: []*coreapi.AuthFilter{
-			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "alice"}}},
+			{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
 		},
 	})
 	if err == nil {

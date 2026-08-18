@@ -1,18 +1,28 @@
 package crons
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/auth"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	robfigcron "github.com/robfig/cron/v3"
 )
+
+// newUUID generates an app-side cron_id, mirroring runs/store.go's newUUID —
+// used so Create's idempotent INSERT ... ON CONFLICT (cron_id) DO NOTHING and
+// its UNION ALL fallback SELECT always target the same, already-known id.
+func newUUID() string { return uuid.New().String() }
 
 // Store provides read-only access to the cron table.
 type Store struct {
@@ -24,20 +34,21 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 // Cron is the internal representation of a cron row.
 type Cron struct {
-	CronID         string
-	ThreadID       string // empty string when NULL
-	UserID         string // empty string when NULL
-	AssistantID    string
-	Schedule       string
-	NextRunDate    *time.Time // nullable
-	EndTime        *time.Time // nullable
-	Payload        []byte
-	Metadata       []byte
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	Enabled        bool
-	Timezone       string
-	OnRunCompleted string // empty string = NULL; otherwise an enum name
+	CronID            string
+	ThreadID          string // empty string when NULL
+	UserID            string // empty string when NULL
+	AssistantID       string
+	Schedule          string
+	NextRunDate       *time.Time // nullable
+	EndTime           *time.Time // nullable
+	Payload           []byte
+	Metadata          []byte
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Enabled           bool
+	Timezone          string
+	OnRunCompleted    string // empty string = NULL; otherwise an enum name
+	EncryptionContext []byte // NULL when no context was recorded at create time (fix round 1, finding 2)
 }
 
 // cronCols is the SELECT projection for all Cron fields (unqualified, for single-table queries).
@@ -54,7 +65,8 @@ const cronCols = `cron_id::text,
 	updated_at,
 	COALESCE(enabled, TRUE),
 	COALESCE(timezone, ''),
-	COALESCE(on_run_completed, '')`
+	COALESCE(on_run_completed, ''),
+	encryption_context::text::bytea`
 
 // cronColsAliased returns the SELECT projection for all Cron fields.
 // When aliased is true (i.e. a JOIN is in play), all columns are qualified with "c."
@@ -76,7 +88,8 @@ func cronColsAliased(aliased bool) string {
 	c.updated_at,
 	COALESCE(c.enabled, TRUE),
 	COALESCE(c.timezone, ''),
-	COALESCE(c.on_run_completed, '')`
+	COALESCE(c.on_run_completed, ''),
+	c.encryption_context::text::bytea`
 }
 
 // SearchInput carries the optional filter parameters for Search and Count.
@@ -104,17 +117,19 @@ var cronsSortColumns = map[string]string{
 }
 
 // cronsSortClause returns the ORDER BY fragment for the given sort_by/sort_order.
-// Default: "created_at DESC" (ops.py:2398).
+// Default: "created_at DESC" (ops.py:2398). NULLS ordering follows ops.py:2494:
+// ASC gets NULLS FIRST, DESC gets NULLS LAST (nullable columns: thread_id,
+// next_run_date, end_time).
 func cronsSortClause(sortBy, sortOrder string) string {
 	col, ok := cronsSortColumns[sortBy]
 	if !ok {
-		return "created_at DESC"
+		col, sortOrder = "created_at", "desc"
 	}
-	dir := "DESC"
+	dir, nulls := "DESC", "NULLS LAST"
 	if sortOrder == "asc" {
-		dir = "ASC"
+		dir, nulls = "ASC", "NULLS FIRST"
 	}
-	return col + " " + dir
+	return col + " " + dir + " " + nulls
 }
 
 // whereArgsResult holds the output of whereArgs.
@@ -128,10 +143,10 @@ type whereArgsResult struct {
 // whereArgs builds the FROM/WHERE fragment and argument slice shared by Search and Count.
 // idx is the starting $N placeholder index (1-based).
 //
-// When in.ThreadFilters is non-empty an INNER JOIN with the thread table is added.
-// INNER JOIN semantics mean crons with a NULL thread_id are excluded when
-// thread_filters is set — this matches the Python behaviour where thread_filters
-// always constrains to existing threads.
+// When in.ThreadFilters is non-empty a LEFT JOIN with the thread table is added
+// (ops.py:2430-2441). LEFT JOIN + "(c.thread_id IS NULL OR (<thread filter>))"
+// means crons with no thread (NULL thread_id) are exempt from thread_filters —
+// they pass unconditionally — while crons with a thread are still constrained.
 func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, error) {
 	// Determine whether we need to join with the thread table.
 	joinThread := len(in.ThreadFilters) > 0
@@ -140,7 +155,7 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, 
 	// Column prefix for cron-table columns (needed when joining to avoid ambiguity).
 	cp := "" // cron prefix: "" when no join, "c." when joining
 	if joinThread {
-		from = "cron c INNER JOIN thread t ON c.thread_id = t.thread_id"
+		from = "cron c LEFT JOIN thread t ON c.thread_id = t.thread_id"
 		cp = "c."
 	} else {
 		from = "cron c"
@@ -179,14 +194,16 @@ func whereArgs(in SearchInput, filters []*coreapi.AuthFilter) (whereArgsResult, 
 		idx += len(authArgs)
 	}
 
-	// Thread auth filters applied to t.metadata via the JOIN.
+	// Thread auth filters applied to t.metadata via the LEFT JOIN. A cron with
+	// no thread (c.thread_id IS NULL) is exempt — it passes regardless of the
+	// filter (ops.py:2441).
 	if joinThread {
 		threadAuthSQL, threadAuthArgs, err := auth.ApplyToQuery(in.ThreadFilters, "t.metadata", idx)
 		if err != nil {
 			return whereArgsResult{}, fmt.Errorf("thread auth: %w", err)
 		}
 		if threadAuthSQL != "" {
-			wheres = append(wheres, threadAuthSQL)
+			wheres = append(wheres, fmt.Sprintf("(c.thread_id IS NULL OR (%s))", threadAuthSQL))
 			args = append(args, threadAuthArgs...)
 			idx += len(threadAuthArgs)
 		}
@@ -271,6 +288,7 @@ func scanCron(row pgx.Row, c *Cron) error {
 		&c.Enabled,
 		&c.Timezone,
 		&c.OnRunCompleted,
+		&c.EncryptionContext,
 	)
 }
 
@@ -284,35 +302,48 @@ func prefixWithAnd(frag string) string {
 
 // CreateCronInput carries the fields for a new cron row.
 type CreateCronInput struct {
-	CronID           string              // optional; empty → gen_random_uuid()
-	AssistantID      string
-	ThreadID         string              // optional
-	UserID           string              // optional
-	Schedule         string
-	Timezone         string
-	Enabled          bool
-	EndTime          *time.Time
-	Payload          []byte
-	Metadata         []byte
-	OnRunCompleted   string              // optional; empty → NULL
-	Filters          []*coreapi.AuthFilter // cron-scoped auth filters (applied to cron.metadata in conflict SELECT)
-	AssistantFilters []*coreapi.AuthFilter // auth filters applied to assistant.metadata (ops.py:2185)
-	ThreadFilters    []*coreapi.AuthFilter // auth filters applied to thread.metadata   (ops.py:2210)
+	CronID            string // optional; empty → app-generated newUUID() (4e: resolved before INSERT so ON CONFLICT/UNION ALL fallback target the same row)
+	AssistantID       string
+	ThreadID          string // optional
+	UserID            string // optional
+	Schedule          string
+	Timezone          string
+	Enabled           bool
+	EndTime           *time.Time
+	Payload           []byte
+	Metadata          []byte
+	OnRunCompleted    string                // optional; empty → NULL
+	EncryptionContext []byte                // optional; nil → column stays NULL (fix round 1, finding 2)
+	Filters           []*coreapi.AuthFilter // cron-scoped auth filters (applied to cron.metadata in conflict SELECT)
+	AssistantFilters  []*coreapi.AuthFilter // auth filters applied to assistant.metadata (ops.py:2185)
+	ThreadFilters     []*coreapi.AuthFilter // auth filters applied to thread.metadata   (ops.py:2210)
 }
 
-// Create inserts a new cron row. next_run_date is computed from the schedule
-// using robfig/cron/v3 with the row's timezone (or UTC if empty).
+// Create inserts a new cron row, or returns the pre-existing row when
+// cron_id already exists — an idempotent create (4e) mirroring ops.py:2237-
+// 2260's "cron_id = cron_id or uuid6()" + "ON CONFLICT (cron_id) DO NOTHING"
+// + UNION ALL fallback SELECT. cron_id is always resolved app-side (newUUID()
+// when in.CronID is empty) so both the INSERT and the fallback SELECT target
+// the same row. next_run_date is computed from the schedule using
+// robfig/cron/v3 with the row's timezone (or UTC if empty).
 //
-// When AssistantFilters or ThreadFilters are provided the INSERT is wrapped in
-// CTEs that gate the insert on auth visibility of the assistant and/or thread —
-// mirroring Python ops.py:2182-2260.  A zero-row result means the assistant/thread
-// was not found or not authorized; the caller should map this to codes.NotFound.
+// When AssistantFilters or ThreadFilters are provided the INSERT leg is
+// wrapped in CTEs that gate it on auth visibility of the assistant and/or
+// thread — mirroring Python ops.py:2182-2260. in.Filters (cron-scoped) gates
+// the fallback SELECT's pre-existing-row leg the same way. A zero-row result
+// (neither leg matches) means not found or not authorized on both legs; the
+// caller should map this to codes.NotFound.
 func (s *Store) Create(ctx context.Context, in CreateCronInput) (*Cron, error) {
 	if in.Payload == nil {
 		in.Payload = []byte(`{}`)
 	}
 	if in.Metadata == nil {
 		in.Metadata = []byte(`{}`)
+	}
+
+	cronID := in.CronID
+	if cronID == "" {
+		cronID = newUUID()
 	}
 
 	// Compute next_run_date. computeNextRun prefixes parse errors with "schedule parse:".
@@ -322,16 +353,8 @@ func (s *Store) Create(ctx context.Context, in CreateCronInput) (*Cron, error) {
 	}
 
 	// ── Build args and SQL fragments ───────────────────────────────────────
-	args := []any{}
-
-	// cron_id
-	var idSQL string
-	if in.CronID != "" {
-		args = append(args, in.CronID)
-		idSQL = fmt.Sprintf("$%d::uuid", len(args))
-	} else {
-		idSQL = "gen_random_uuid()"
-	}
+	args := []any{cronID}
+	idSQL := "$1::uuid"
 
 	// base is the $N index for assistant_id (first fixed positional column).
 	// Compute BEFORE the append so it reflects the next available slot.
@@ -365,172 +388,175 @@ func (s *Store) Create(ctx context.Context, in CreateCronInput) (*Cron, error) {
 	} else {
 		orcSQL = "NULL"
 	}
+	var encCtxSQL string
+	if in.EncryptionContext != nil {
+		args = append(args, in.EncryptionContext)
+		encCtxSQL = fmt.Sprintf("$%d::jsonb", len(args))
+	} else {
+		encCtxSQL = "NULL"
+	}
 
 	// ── Auth CTE construction (ops.py:2182-2260) ──────────────────────────
 	//
-	// When AssistantFilters or ThreadFilters are present, wrap the INSERT in
-	// CTEs that gate the insert on auth visibility of the assistant and/or
-	// thread — mirroring Python ops.py:2182-2260.
-	// Missing/unauthorized → zero rows → ErrNotFound.
-	//
-	// When no filters are present, fall through to a plain INSERT RETURNING.
-	needCTE := len(in.AssistantFilters) > 0 || (in.ThreadID != "" && len(in.ThreadFilters) > 0)
+	// Always wrap the INSERT in an "inserted_cron" CTE (needed for the
+	// ON CONFLICT DO NOTHING + UNION ALL idempotent-create shape below);
+	// additional authorized_assistant/authorized_thread CTEs are prepended
+	// only when AssistantFilters/ThreadFilters are present.
+	idx := len(args) + 1
 
-	var q string
-	if !needCTE {
-		// ── Plain INSERT (no auth CTEs needed) ────────────────────────────
-		q = fmt.Sprintf(`
-			INSERT INTO cron
-				(cron_id, assistant_id, thread_id, user_id, schedule, timezone, enabled,
-				 next_run_date, end_time, payload, metadata, on_run_completed, created_at, updated_at)
-			VALUES
-				(%s, $%d::uuid, %s, %s, $%d, $%d, $%d, $%d, %s, $%d::jsonb, $%d::jsonb, %s, now(), now())
-			RETURNING %s`,
-			idSQL,
-			base,      // assistant_id ($base)
-			threadSQL, // thread_id
-			userSQL,   // user_id
-			base+1,    // schedule
-			base+2,    // timezone
-			base+3,    // enabled
-			base+4,    // next_run_date
-			endSQL,    // end_time
-			base+5,    // payload
-			base+6,    // metadata
-			orcSQL,    // on_run_completed
-			cronCols,
+	var (
+		ctePrefix             string
+		insertAssistantSelect string
+		insertAssistantFrom   string
+		insertThreadSelect    string
+		insertThreadJoin      string
+	)
+
+	if len(in.AssistantFilters) > 0 {
+		// authorized_assistant CTE (ops.py:2191-2199).
+		// Reuse $base (already in args) as the assistant_id parameter.
+		// This avoids leaving an unreferenced $N which PG can't type-infer.
+		aSQL, aArgs, err := auth.ApplyToQuery(in.AssistantFilters, "assistant.metadata", idx)
+		if err != nil {
+			return nil, fmt.Errorf("assistant auth: %w", err)
+		}
+		args = append(args, aArgs...)
+		idx += len(aArgs)
+
+		var andFilter string
+		if aSQL != "" {
+			andFilter = " AND " + aSQL
+		}
+		// $base is already the assistant_id in args (reuse it in the CTE WHERE).
+		ctePrefix = fmt.Sprintf(
+			"WITH authorized_assistant AS (\n"+
+				"    SELECT assistant.assistant_id FROM assistant\n"+
+				"    WHERE assistant.assistant_id = $%d::uuid%s\n"+
+				"),\n",
+			base, andFilter,
 		)
+		insertAssistantSelect = "authorized_assistant.assistant_id"
+		insertAssistantFrom = "FROM authorized_assistant"
 	} else {
-		// ── CTE-gated INSERT (ops.py:2237-2259) ──────────────────────────
-		//
-		// Build CTE prefix for assistant and/or thread auth.
-		// Placeholders start at idx which is currently len(args)+1 (after the
-		// base fixed columns and optional nullable columns are all in args).
-		idx := len(args) + 1
+		// No assistant filter: $base is already the assistant_id literal.
+		insertAssistantSelect = fmt.Sprintf("$%d::uuid", base)
+		insertAssistantFrom = ""
+	}
 
-		var (
-			ctePrefix            string
-			insertAssistantSelect string
-			insertAssistantFrom  string
-			insertThreadSelect   string
-			insertThreadJoin     string
+	if in.ThreadID != "" && len(in.ThreadFilters) > 0 {
+		// authorized_thread CTE (ops.py:2217-2230).
+		// Reuse threadSQL (already in args as $N::uuid) in the CTE WHERE.
+		tSQL, tArgs, err := auth.ApplyToQuery(in.ThreadFilters, "thread.metadata", idx)
+		if err != nil {
+			return nil, fmt.Errorf("thread auth: %w", err)
+		}
+		args = append(args, tArgs...)
+		idx += len(tArgs)
+
+		var andFilter string
+		if tSQL != "" {
+			andFilter = " AND " + tSQL
+		}
+
+		if ctePrefix == "" {
+			ctePrefix = "WITH "
+		}
+		// threadSQL is already "$N::uuid" where N references the thread_id in args.
+		ctePrefix += fmt.Sprintf(
+			"authorized_thread AS (\n"+
+				"    SELECT thread.thread_id FROM thread\n"+
+				"    WHERE thread.thread_id = %s%s\n"+
+				"),\n",
+			threadSQL, andFilter,
 		)
 
-		if len(in.AssistantFilters) > 0 {
-			// authorized_assistant CTE (ops.py:2191-2199).
-			// Reuse $base (already in args) as the assistant_id parameter.
-			// This avoids leaving an unreferenced $N which PG can't type-infer.
-			aSQL, aArgs, err := auth.ApplyToQuery(in.AssistantFilters, "assistant.metadata", idx)
-			if err != nil {
-				return nil, fmt.Errorf("assistant auth: %w", err)
-			}
-			args = append(args, aArgs...)
-			idx += len(aArgs)
-
-			var andFilter string
-			if aSQL != "" {
-				andFilter = " AND " + aSQL
-			}
-			// $base is already the assistant_id in args (reuse it in the CTE WHERE).
-			ctePrefix = fmt.Sprintf(
-				"WITH authorized_assistant AS (\n"+
-					"    SELECT assistant.assistant_id FROM assistant\n"+
-					"    WHERE assistant.assistant_id = $%d::uuid%s\n"+
-					"),\n",
-				base, andFilter,
-			)
-			insertAssistantSelect = "authorized_assistant.assistant_id"
-			insertAssistantFrom = "FROM authorized_assistant"
+		insertThreadSelect = "authorized_thread.thread_id"
+		if insertAssistantFrom != "" {
+			insertThreadJoin = "CROSS JOIN authorized_thread"
 		} else {
-			// No assistant filter: $base is already the assistant_id literal.
-			insertAssistantSelect = fmt.Sprintf("$%d::uuid", base)
-			insertAssistantFrom = ""
+			insertThreadJoin = "FROM authorized_thread"
 		}
+	} else {
+		insertThreadSelect = threadSQL // already "NULL" or "$N::uuid"
+		insertThreadJoin = ""
+	}
 
-		if in.ThreadID != "" && len(in.ThreadFilters) > 0 {
-			// authorized_thread CTE (ops.py:2217-2230).
-			// Reuse threadSQL (already in args as $N::uuid) in the CTE WHERE.
-			tSQL, tArgs, err := auth.ApplyToQuery(in.ThreadFilters, "thread.metadata", idx)
-			if err != nil {
-				return nil, fmt.Errorf("thread auth: %w", err)
-			}
-			args = append(args, tArgs...)
-			idx += len(tArgs)
-
-			var andFilter string
-			if tSQL != "" {
-				andFilter = " AND " + tSQL
-			}
-
-			if ctePrefix == "" {
-				ctePrefix = "WITH "
-			}
-			// threadSQL is already "$N::uuid" where N references the thread_id in args.
-			ctePrefix += fmt.Sprintf(
-				"authorized_thread AS (\n"+
-					"    SELECT thread.thread_id FROM thread\n"+
-					"    WHERE thread.thread_id = %s%s\n"+
-					"),\n",
-				threadSQL, andFilter,
-			)
-
-			insertThreadSelect = "authorized_thread.thread_id"
-			if insertAssistantFrom != "" {
-				insertThreadJoin = "CROSS JOIN authorized_thread"
-			} else {
-				insertThreadJoin = "FROM authorized_thread"
-			}
+	insertFrom := insertAssistantFrom
+	if insertThreadJoin != "" {
+		if insertFrom != "" {
+			insertFrom += "\n        " + insertThreadJoin
 		} else {
-			insertThreadSelect = threadSQL // already "NULL" or "$N::uuid"
-			insertThreadJoin = ""
+			insertFrom = insertThreadJoin
 		}
+	}
+	if ctePrefix == "" {
+		// No auth CTEs needed — still need the wrapping WITH for inserted_cron.
+		ctePrefix = "WITH "
+	}
 
-		insertFrom := insertAssistantFrom
-		if insertThreadJoin != "" {
-			if insertFrom != "" {
-				insertFrom += "\n    " + insertThreadJoin
-			} else {
-				insertFrom = insertThreadJoin
-			}
-		}
+	// ── Fallback SELECT auth filter (ops.py:2249's UNION ALL leg) ─────────
+	// Gates visibility of a pre-existing row: a caller without in.Filters
+	// visibility into that row gets ErrNotFound rather than someone else's cron.
+	fallbackAuthSQL, fallbackAuthArgs, err := auth.ApplyToQuery(in.Filters, "c.metadata", idx)
+	if err != nil {
+		return nil, fmt.Errorf("fallback auth: %w", err)
+	}
+	args = append(args, fallbackAuthArgs...)
+	var fallbackAndFilter string
+	if fallbackAuthSQL != "" {
+		fallbackAndFilter = " AND " + fallbackAuthSQL
+	}
 
-		// ctePrefix ends with ",\n" — append the inserting CTE.
-		// base points to assistant_id ($base), so schedule is $base+1, etc.
-		// The final SELECT uses * to avoid re-evaluating the RETURNING expressions
-		// (which would fail to resolve unqualified column names against the CTE).
-		q = fmt.Sprintf(`%scte_insert AS (
+	// base points to assistant_id ($base), so schedule is $base+1, etc.
+	// The inserted_cron leg selects * to avoid re-evaluating the RETURNING
+	// expressions (which would fail to resolve unqualified column names
+	// against the CTE, since e.g. COALESCE(payload,...) is auto-named
+	// "coalesce" by Postgres in inserted_cron's output, not "payload");
+	// the fallback leg re-applies cronColsAliased itself since it selects
+	// straight from the cron table.
+	q := fmt.Sprintf(`%sinserted_cron AS (
     INSERT INTO cron
         (cron_id, assistant_id, thread_id, user_id, schedule, timezone, enabled,
-         next_run_date, end_time, payload, metadata, on_run_completed, created_at, updated_at)
+         next_run_date, end_time, payload, metadata, on_run_completed, encryption_context,
+         created_at, updated_at)
     SELECT
-        %s, %s, %s, %s, $%d, $%d, $%d, $%d, %s, $%d::jsonb, $%d::jsonb, %s, now(), now()
+        %s, %s, %s, %s, $%d, $%d, $%d, $%d, %s, $%d::jsonb, $%d::jsonb, %s, %s, now(), now()
     %s
+    ON CONFLICT (cron_id) DO NOTHING
     RETURNING %s
 )
-SELECT * FROM cte_insert`,
-			ctePrefix,
-			idSQL,
-			insertAssistantSelect, // CTE col or literal $N::uuid
-			insertThreadSelect,    // CTE col or "NULL" or "$N::uuid"
-			userSQL,
-			base+1,    // schedule
-			base+2,    // timezone
-			base+3,    // enabled
-			base+4,    // next_run_date
-			endSQL,    // end_time
-			base+5,    // payload
-			base+6,    // metadata
-			orcSQL,    // on_run_completed
-			insertFrom,
-			cronCols,
-		)
-	}
+SELECT * FROM inserted_cron
+UNION ALL
+SELECT %s FROM cron c WHERE c.cron_id = %s%s
+LIMIT 1`,
+		ctePrefix,
+		idSQL,
+		insertAssistantSelect, // CTE col or literal $N::uuid
+		insertThreadSelect,    // CTE col or "NULL" or "$N::uuid"
+		userSQL,
+		base+1,    // schedule
+		base+2,    // timezone
+		base+3,    // enabled
+		base+4,    // next_run_date
+		endSQL,    // end_time
+		base+5,    // payload
+		base+6,    // metadata
+		orcSQL,    // on_run_completed
+		encCtxSQL, // encryption_context
+		insertFrom,
+		cronCols,
+		cronColsAliased(true),
+		idSQL,
+		fallbackAndFilter,
+	)
 
 	var c Cron
 	if err := scanCron(s.pool.QueryRow(ctx, q, args...), &c); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// CTE yielded no rows: assistant/thread not found or not authorized.
-			// Caller maps this to codes.NotFound (ops.py:2278-2281).
+			// Neither leg matched: assistant/thread not found/not authorized
+			// on the insert leg, or the pre-existing row is hidden by
+			// in.Filters on the fallback leg. Caller maps this to
+			// codes.NotFound (ops.py:2278-2281).
 			return nil, ErrNotFound
 		}
 		return nil, err
@@ -549,8 +575,11 @@ type PatchCronInput struct {
 	OnRunCompleted *string // nil = no change; non-nil = write (empty string clears)
 }
 
-// Patch updates mutable cron fields. If Schedule changes, next_run_date is
-// recomputed. Returns the updated Cron or ErrNotFound.
+// Patch updates mutable cron fields. If Schedule or Timezone changes,
+// next_run_date is recomputed using the stored value of whichever of the two
+// is not itself being patched (4d-iii). Payload and Metadata are merged
+// (JSONB ||), not replaced (4d-ii) — matching ops.py's PATCH semantics of
+// sending only the changed keys. Returns the updated Cron or ErrNotFound.
 func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, filters []*coreapi.AuthFilter) (*Cron, error) {
 	authSQL, authArgs, err := auth.ApplyToQuery(filters, "metadata", 2)
 	if err != nil {
@@ -560,19 +589,40 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 	args := []any{cronID}
 	idx := 2 + len(authArgs)
 
-	if in.Schedule != "" {
-		sets = append(sets, fmt.Sprintf("schedule = $%d", idx))
-		args = append(args, in.Schedule)
-		idx++
-		// Recompute next_run_date when schedule changes.
+	// Recompute next_run_date when either schedule OR timezone is patched
+	// (4d-iii): load the stored value for whichever field is absent so e.g.
+	// patching only timezone doesn't silently recompute against schedule=""
+	// or patching only schedule doesn't drop the row's existing timezone.
+	if in.Schedule != "" || in.Timezone != "" {
+		schedule, timezone := in.Schedule, in.Timezone
+		if schedule == "" || timezone == "" {
+			var storedSchedule, storedTimezone string
+			row := s.pool.QueryRow(ctx, `SELECT schedule, COALESCE(timezone, '') FROM cron WHERE cron_id = $1::uuid`, cronID)
+			if err := row.Scan(&storedSchedule, &storedTimezone); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return nil, ErrNotFound
+				}
+				return nil, err
+			}
+			if schedule == "" {
+				schedule = storedSchedule
+			}
+			if timezone == "" {
+				timezone = storedTimezone
+			}
+		}
 		// computeNextRun already prefixes parse errors with "schedule parse:".
-		tz := in.Timezone
-		nextRun, err := computeNextRun(in.Schedule, tz)
+		nextRun, err := computeNextRun(schedule, timezone)
 		if err != nil {
 			return nil, err
 		}
 		sets = append(sets, fmt.Sprintf("next_run_date = $%d", idx))
 		args = append(args, nextRun)
+		idx++
+	}
+	if in.Schedule != "" {
+		sets = append(sets, fmt.Sprintf("schedule = $%d", idx))
+		args = append(args, in.Schedule)
 		idx++
 	}
 	if in.Timezone != "" {
@@ -591,13 +641,51 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		args = append(args, *in.EndTime)
 		idx++
 	}
+	// A payload patch needs to read-modify-write the row: legacy
+	// protojson-shaped rows (pre-4a) must be converted to dict shape before
+	// the patch is folded in, or the patch keys are silently dropped on
+	// every future read (fix round 1, finding 2). That read-modify-write
+	// must run under a lock held across both the read and Patch's own final
+	// UPDATE (fix round 2, finding 2 — otherwise two concurrent Patch calls
+	// on the same legacy row race and one's merge is lost), and the read
+	// must itself be auth-filtered, not just the final UPDATE (fix round 2,
+	// finding 1 — otherwise an unauthorized caller can trigger the shape
+	// rewrite as a side effect before the auth check ever runs).
+	var querier interface {
+		QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	} = s.pool
+	var tx pgx.Tx
 	if len(in.Payload) > 0 {
+		tx, err = s.pool.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+		querier = tx
+
+		lockQ := fmt.Sprintf(`SELECT payload FROM cron WHERE cron_id = $1::uuid%s FOR UPDATE`, prefixWithAnd(authSQL))
+		var raw []byte
+		if err := tx.QueryRow(ctx, lockQ, append([]any{cronID}, authArgs...)...).Scan(&raw); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		merged, err := mergePayload(raw, in.Payload)
+		if err != nil {
+			return nil, err
+		}
+		// Full replace, not `||`: merged already folds the (possibly
+		// legacy-converted) locked payload together with the patch. An
+		// SQL-side `||` here would re-read the column itself and reopen the
+		// exact race the row lock above is meant to close.
 		sets = append(sets, fmt.Sprintf("payload = $%d::jsonb", idx))
-		args = append(args, in.Payload)
+		args = append(args, merged)
 		idx++
 	}
 	if len(in.Metadata) > 0 {
-		sets = append(sets, fmt.Sprintf("metadata = $%d::jsonb", idx))
+		// Merge, not replace (4d-ii): metadata = metadata || $n::jsonb.
+		sets = append(sets, fmt.Sprintf("metadata = metadata || $%d::jsonb", idx))
 		args = append(args, in.Metadata)
 		idx++
 	}
@@ -617,19 +705,72 @@ func (s *Store) Patch(ctx context.Context, cronID string, in PatchCronInput, fil
 		cronCols,
 	)
 	var c Cron
-	if err := scanCron(s.pool.QueryRow(ctx, q, finalArgs...), &c); err != nil {
+	if err := scanCron(querier.QueryRow(ctx, q, finalArgs...), &c); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return &c, nil
+}
+
+// mergePayload folds a payload patch onto a stored payload, converting the
+// stored value from legacy protojson shape (pre-4a) to the Python-dict shape
+// payloadProtoToDict produces first if needed — same shallow-merge semantics
+// as the JSONB `||` operator (patch keys win on collision, everything else
+// from the stored value is kept), just computed in Go against an
+// already-locked read so the caller can write the result back with a plain
+// `=` instead of a second `||` that would re-read the column and reopen the
+// race the lock is for. rawStored empty, "{}", or unparseable-as-legacy-JSON
+// is treated as an empty base (best-effort, matching the prior behavior this
+// replaces).
+func mergePayload(rawStored, patch []byte) ([]byte, error) {
+	base := map[string]json.RawMessage{}
+	trimmed := bytes.TrimSpace(rawStored)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(`{}`)) {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &fields); err == nil {
+			base = fields
+			if isLegacyPayloadShape(fields) {
+				p := &coreapi.CronPayload{}
+				if err := jsonbutil.Unmarshal(trimmed, p); err == nil {
+					converted := map[string]json.RawMessage{}
+					for k, v := range payloadProtoToDict(p) {
+						b, err := json.Marshal(v)
+						if err != nil {
+							return nil, err
+						}
+						converted[k] = b
+					}
+					base = converted
+				}
+				// Unparseable legacy JSON falls back to the raw fields
+				// as-is rather than dropping them.
+			}
+		}
+	}
+
+	var patchFields map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &patchFields); err != nil {
+		return nil, fmt.Errorf("payload patch: %w", err)
+	}
+	for k, v := range patchFields {
+		base[k] = v
+	}
+	return json.Marshal(base)
 }
 
 // ErrNotFound is returned when a cron is not found or hidden by auth filters.
 var ErrNotFound = errors.New("cron not found")
 
 // Delete removes the cron matching cronID (with optional auth filters).
+// Returns ErrNotFound when no row matched (not found, or hidden by auth
+// filters) — mirroring ops.py:2290-2318 + the route's fetchone 404 (4f).
 func (s *Store) Delete(ctx context.Context, cronID string, filters []*coreapi.AuthFilter) error {
 	authSQL, args, err := auth.ApplyToQuery(filters, "metadata", 2)
 	if err != nil {
@@ -639,8 +780,14 @@ func (s *Store) Delete(ctx context.Context, cronID string, filters []*coreapi.Au
 		`DELETE FROM cron WHERE cron_id = $1::uuid%s`,
 		prefixWithAnd(authSQL),
 	)
-	_, err = s.pool.Exec(ctx, q, append([]any{cronID}, args...)...)
-	return err
+	tag, err := s.pool.Exec(ctx, q, append([]any{cronID}, args...)...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // CronWithNow pairs a cron row with the DB-clock snapshot (now()) captured
@@ -651,8 +798,14 @@ type CronWithNow struct {
 	Now  time.Time // DB-side now() snapshot
 }
 
-// Next returns all enabled crons whose next_run_date <= now() and that have
-// not yet expired, ordered by next_run_date ASC. Used by the CronScheduler goroutine.
+// Next atomically claims and advances all enabled, due crons in one
+// transaction: SELECT ... FOR NO KEY UPDATE SKIP LOCKED (ops.py:2320-2338
+// shape) claims the rows so a concurrent Next() on another replica can't
+// double-claim them, then next_run_date is recomputed and persisted for each
+// claimed row before COMMIT — replacing the old design where the scheduler
+// advanced next_run_date itself via a separate SetNextRunDate call after the
+// lock had already been released (a race window across scheduler replicas).
+// Used by the CronScheduler goroutine.
 //
 // Predicates follow ops.py:2325-2328:
 //   - (end_time IS NULL OR end_time >= now())  -- keep-verbatim from Python
@@ -661,30 +814,68 @@ type CronWithNow struct {
 // enabled = TRUE is an LSD-only extension (not in Python's internal API which
 // has no concept of per-cron disabling); kept because it is an LSD-exposed feature.
 func (s *Store) Next(ctx context.Context) ([]*CronWithNow, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
 	q := fmt.Sprintf(
 		`SELECT %s, now() FROM cron
 		 WHERE enabled = TRUE
 		   AND next_run_date IS NOT NULL
 		   AND next_run_date <= now()
 		   AND (end_time IS NULL OR end_time >= now())
-		 ORDER BY next_run_date ASC, cron_id ASC`,
+		 ORDER BY next_run_date ASC, cron_id ASC
+		 FOR NO KEY UPDATE SKIP LOCKED`,
 		cronCols,
 	)
-	rows, err := s.pool.Query(ctx, q)
+	rows, err := tx.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []*CronWithNow
 	for rows.Next() {
 		var c Cron
 		var dbNow time.Time
 		if err := scanCronWithNow(rows, &c, &dbNow); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, &CronWithNow{Cron: &c, Now: dbNow})
 	}
-	return out, rows.Err()
+	closeErr := rows.Err()
+	rows.Close()
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	claimed := out[:0] // filter in place: drop rows whose schedule fails to recompute
+	for _, cw := range out {
+		// Base the recompute on the DB-side now() snapshot, matching Python
+		// cron_scheduler.py:131 (cron["now"]).
+		next, err := computeNextRunFrom(cw.Cron.Schedule, cw.Cron.Timezone, cw.Now)
+		if err != nil {
+			// Reachable despite Create/Patch validation via the 4i dialect gap
+			// (croniter accepts L/#/7=Sunday forms robfig can't parse) or rows
+			// written before Go-side validation existed. Drop the row from
+			// this tick's results and log rather than firing it — otherwise,
+			// since next_run_date is left un-advanced, it stays "due" and
+			// would fire again on every future tick forever (fix round 1).
+			slog.Default().Error("cron: unparseable schedule, skipping tick",
+				"cron_id", cw.Cron.CronID, "schedule", cw.Cron.Schedule, "err", err)
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE cron SET next_run_date = $2 WHERE cron_id = $1::uuid`, cw.Cron.CronID, next); err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, cw)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return claimed, nil
 }
 
 // scanCronWithNow populates a Cron and the trailing now() column from a pgx row.
@@ -704,14 +895,17 @@ func scanCronWithNow(row pgx.Row, c *Cron, dbNow *time.Time) error {
 		&c.Enabled,
 		&c.Timezone,
 		&c.OnRunCompleted,
+		&c.EncryptionContext,
 		dbNow,
 	)
 }
 
 // SetNextRunDate updates a cron's next_run_date to the given time.
+// Does not bump updated_at (ops.py:2341-2351 — 4h: this is an internal
+// scheduling field, not a user-visible mutation).
 func (s *Store) SetNextRunDate(ctx context.Context, cronID string, next time.Time) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE cron SET next_run_date = $2, updated_at = now() WHERE cron_id = $1::uuid`,
+		`UPDATE cron SET next_run_date = $2 WHERE cron_id = $1::uuid`,
 		cronID, next,
 	)
 	return err
@@ -738,7 +932,12 @@ func computeNextRunFrom(schedule, timezone string, base time.Time) (time.Time, e
 			return time.Time{}, fmt.Errorf("schedule parse: load timezone %q: %w", timezone, err)
 		}
 	}
-	p := robfigcron.NewParser(robfigcron.Minute | robfigcron.Hour | robfigcron.Dom | robfigcron.Month | robfigcron.Dow)
+	// Descriptor enables @daily/@hourly/etc; SecondOptional accepts 6-field
+	// schedules — both of which croniter (the Python reference parser) accepts
+	// (ops.py:2174 validates via croniter). robfig still lacks croniter's L/#/
+	// "7=Sunday" forms.
+	// ponytail: robfig lacks L/#; swap cron lib if users hit it.
+	p := robfigcron.NewParser(robfigcron.Minute | robfigcron.Hour | robfigcron.Dom | robfigcron.Month | robfigcron.Dow | robfigcron.Descriptor | robfigcron.SecondOptional)
 	sched, err := p.Parse(schedule)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("schedule parse: %w", err)

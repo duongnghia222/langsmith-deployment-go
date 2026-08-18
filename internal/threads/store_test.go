@@ -482,7 +482,7 @@ func TestThreadExistsAndAuth(t *testing.T) {
 
 	// Positive: matching filter.
 	matchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "carol"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"carol"`}}},
 	}
 	if err := store.ThreadExistsAndAuth(ctx, threadID, matchFilter); err != nil {
 		t.Errorf("matching filter: %v", err)
@@ -490,7 +490,7 @@ func TestThreadExistsAndAuth(t *testing.T) {
 
 	// Negative: mismatched filter → ErrForbidden.
 	mismatchFilter := []*coreapi.AuthFilter{
-		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: "eve"}}},
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"eve"`}}},
 	}
 	if err := store.ThreadExistsAndAuth(ctx, threadID, mismatchFilter); err == nil {
 		t.Error("mismatch filter: expected error, got nil")
@@ -689,6 +689,55 @@ func TestStore_Create_AtomicDoNothing_ReturnsSameRow(t *testing.T) {
 	}
 }
 
+// TestStore_Create_DoNothing_AuthFilters proves auth filters are applied to
+// the do_nothing "return pre-existing row" leg (ops.py:832-846): a matching
+// filter returns the existing thread, a mismatching filter surfaces the same
+// ErrAlreadyExists as an unfiltered conflict (ops.py's fetchone(...,
+// not_found_code=409) treats "no row" identically either way).
+func TestStore_Create_DoNothing_AuthFilters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	id := "c1200001-0000-0000-0000-000000000003"
+
+	if _, err := store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		Metadata: []byte(`{"owner":"alice"}`),
+		IfExists: "do_nothing",
+	}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	matching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"alice"`}}},
+	}
+	second, err := store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		IfExists: "do_nothing",
+		Filters:  matching,
+	})
+	if err != nil {
+		t.Fatalf("do_nothing with matching filter: %v", err)
+	}
+	if second.ThreadID != id {
+		t.Errorf("second.ThreadID = %q, want %q", second.ThreadID, id)
+	}
+
+	mismatching := []*coreapi.AuthFilter{
+		{Filter: &coreapi.AuthFilter_Eq{Eq: &coreapi.EqAuthFilter{Key: "owner", Match: `"bob"`}}},
+	}
+	_, err = store.Create(ctx, threads.CreateThreadInput{
+		ThreadID: id,
+		IfExists: "do_nothing",
+		Filters:  mismatching,
+	})
+	if !errors.Is(err, threads.ErrAlreadyExists) {
+		t.Errorf("do_nothing with mismatching filter: want ErrAlreadyExists, got %v", err)
+	}
+}
+
 func TestStore_Create_RaiseMode_ErrAlreadyExists(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -843,6 +892,232 @@ func TestStore_Search_SortByUpdatedAt(t *testing.T) {
 	}
 	if results[0].ThreadID != ids[1] {
 		t.Errorf("DESC sort: first=%q, want %q", results[0].ThreadID, ids[1])
+	}
+}
+
+// ── Task 3 (WP3): ops.py parity ───────────────────────────────────────────────
+
+// TestStore_Search_EmptyValuesFilter_DoesNotExcludeFreshThreads is the Go
+// defense-in-depth for 3a: NULL @> '{}'::jsonb is NULL (not TRUE) in Postgres,
+// so an unconditional "values" @> filter would wrongly exclude a fresh thread
+// (whose "values" column is still NULL) even when no real filter was intended.
+func TestStore_Search_EmptyValuesFilter_DoesNotExcludeFreshThreads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+
+	th, err := store.Create(ctx, threads.CreateThreadInput{Metadata: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	results, err := store.Search(ctx, threads.SearchInput{
+		ValuesFilter: []byte(`{}`),
+		Ids:          []string{th.ThreadID},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1 (empty values filter must not exclude fresh thread)", len(results))
+	}
+
+	n, err := store.Count(ctx, threads.SearchInput{
+		ValuesFilter: []byte(`{}`),
+		Ids:          []string{th.ThreadID},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Count = %d, want 1 (empty values filter must not exclude fresh thread)", n)
+	}
+}
+
+// TestThreadStore_Patch_DoesNotBumpUpdatedAt is 3d: ops.py:882-885 only ever
+// sets metadata on patch — no updated_at bump.
+func TestThreadStore_Patch_DoesNotBumpUpdatedAt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	id := "a1180001-0000-0000-0000-000000000001"
+	testdb.MustInsertThread(t, ctx, pool, id, []byte(`{"a":1}`))
+	if _, err := pool.Exec(ctx,
+		`UPDATE thread SET updated_at = now() - interval '1 hour' WHERE thread_id=$1::uuid`, id,
+	); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(ctx, id, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	patched, err := store.Patch(ctx, id, threads.PatchThreadInput{Metadata: []byte(`{"b":2}`)}, nil)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if !patched.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Errorf("UpdatedAt changed by Patch: before=%v after=%v, want unchanged (ops.py never bumps updated_at on patch)", before.UpdatedAt, patched.UpdatedAt)
+	}
+}
+
+// TestStore_SetStatus_RealDBError_IsNotSwallowed is 3e: a genuine DB error
+// (not "thread not found") must propagate, not be treated as a silent no-op.
+func TestStore_SetStatus_RealDBError_IsNotSwallowed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	// Malformed UUID → the $3::uuid cast fails with a real Postgres error,
+	// which is a different failure mode than pgx.ErrNoRows.
+	_, err := store.SetStatus(ctx, threads.SetStatusInput{
+		ThreadID:   "not-a-valid-uuid",
+		StatusText: "idle",
+	})
+	if err == nil {
+		t.Fatal("expected a real DB error for malformed thread_id, got nil (errors must not be swallowed as a no-op)")
+	}
+}
+
+// TestStore_SetJointStatus_GraphIDWithSpecialCharacters is 3f: fmt.Sprintf's
+// %q verb escapes using Go string-literal rules (e.g. BEL becomes the two
+// characters backslash+a), which is not a valid JSON escape sequence.
+// json.Marshal must be used so the payload is always valid JSON regardless
+// of what characters graph_id contains.
+func TestStore_SetJointStatus_GraphIDWithSpecialCharacters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g", nil)
+	thID := "a1170001-0000-0000-0000-000000000001"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	rID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+
+	// A literal BEL byte (0x07): Go's %q renders it as the two-character Go
+	// escape `\a`, which is not a valid JSON escape sequence. SetJointStatus
+	// writes graph_id into metadata (metadata = metadata || {"graph_id":...}),
+	// so read it back from there directly.
+	graphID := "weird\x07graph"
+	if err := store.SetJointStatus(ctx, threads.SetJointStatusInput{
+		ThreadID:  thID,
+		RunID:     rID,
+		RunStatus: "idle",
+		GraphID:   graphID,
+	}); err != nil {
+		t.Fatalf("SetJointStatus: %v", err)
+	}
+
+	var got string
+	if err := pool.QueryRow(ctx,
+		`SELECT metadata->>'graph_id' FROM thread WHERE thread_id=$1::uuid`, thID,
+	).Scan(&got); err != nil {
+		t.Fatalf("scan metadata.graph_id: %v", err)
+	}
+	if got != graphID {
+		t.Errorf("metadata.graph_id = %q, want %q", got, graphID)
+	}
+}
+
+// TestThreadStore_Copy_OnlyCarriesThreadIDAndMetadata is 3c(i): ops.py:1087-1089
+// copies ONLY (thread_id, metadata); every other column takes its schema
+// default rather than being inherited from the source row.
+func TestThreadStore_Copy_OnlyCarriesThreadIDAndMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	srcID := "a1190001-0000-0000-0000-000000000001"
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO thread (thread_id, metadata, config, status, "values", created_at, updated_at)
+		 VALUES ($1::uuid, $2::jsonb, $3::jsonb, 'busy', $4::jsonb, now(), now())`,
+		srcID, `{"src":true}`, `{"configurable":{"graph_id":"g"}}`, `{"x":1}`,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	newTh, err := store.Copy(ctx, srcID, nil)
+	if err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if newTh.Status != "idle" {
+		t.Errorf("Status = %q, want idle (schema default, not inherited 'busy')", newTh.Status)
+	}
+	if string(newTh.Config) != "{}" {
+		t.Errorf("Config = %s, want {} (schema default, not inherited)", newTh.Config)
+	}
+	if string(newTh.Values) != "null" {
+		t.Errorf("Values = %s, want null (schema default, not inherited)", newTh.Values)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(newTh.Metadata, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["src"] != true {
+		t.Errorf("Metadata not carried over from source: %s", newTh.Metadata)
+	}
+}
+
+// ── 3g: expected_status busy-guard ────────────────────────────────────────────
+
+func TestStore_SetStatus_ExpectedStatusMismatch_ReturnsFailedPreconditionAndLeavesRowUnchanged(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	id := "a1160001-0000-0000-0000-000000000001"
+	testdb.MustInsertThread(t, ctx, pool, id, nil) // seeded status: idle
+
+	_, err := store.SetStatus(ctx, threads.SetStatusInput{
+		ThreadID:       id,
+		StatusText:     "error",
+		ExpectedStatus: []string{"busy"}, // current status is "idle" — mismatch
+	})
+	if !errors.Is(err, threads.ErrFailedPrecondition) {
+		t.Fatalf("err = %v, want ErrFailedPrecondition", err)
+	}
+
+	th, err := store.Get(ctx, id, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if th.Status != "idle" {
+		t.Errorf("status = %q, want idle (row must be untouched on a busy-guard mismatch)", th.Status)
+	}
+}
+
+func TestStore_SetStatus_ExpectedStatusMatch_Applies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	store, pool := newTestStore(t, ctx)
+	id := "a1160001-0000-0000-0000-000000000002"
+	testdb.MustInsertThread(t, ctx, pool, id, nil) // seeded status: idle
+
+	_, err := store.SetStatus(ctx, threads.SetStatusInput{
+		ThreadID:       id,
+		StatusText:     "interrupted",
+		ExpectedStatus: []string{"idle"}, // matches current status
+	})
+	if err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+
+	th, err := store.Get(ctx, id, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if th.Status != "interrupted" {
+		t.Errorf("status = %q, want interrupted", th.Status)
 	}
 }
 

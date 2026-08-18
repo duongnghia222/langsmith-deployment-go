@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -419,6 +420,13 @@ func (s *Store) DeleteForRuns(ctx context.Context, runIDs []string) error {
 	return nil
 }
 
+// txExecer is satisfied by both pgx.Tx and *pgxpool.Pool's Exec method,
+// letting copyThreadRows run either standalone or inside a caller-managed
+// transaction (3c-ii).
+type txExecer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // CopyThread copies all checkpoints, checkpoint_blobs, and checkpoint_writes
 // rows from fromThreadID to toThreadID in a single transaction (R5 D6).
 func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string) error {
@@ -428,9 +436,25 @@ func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	if err := copyThreadRows(ctx, tx, fromThreadID, toThreadID); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// CopyThreadTx is CopyThread run against a caller-managed transaction.
+// threads.Service.Copy (3c-ii) shares one tx across the thread-row copy and
+// this checkpoint copy, so a failure here rolls back the new thread row too
+// — ops.py:1084-1131 runs both in a single pipeline.
+func (s *Store) CopyThreadTx(ctx context.Context, tx pgx.Tx, fromThreadID, toThreadID string) error {
+	return copyThreadRows(ctx, tx, fromThreadID, toThreadID)
+}
+
+func copyThreadRows(ctx context.Context, ex txExecer, fromThreadID, toThreadID string) error {
 	// C11: Python ops.py:1100-1103 patches copied checkpoints' metadata with
 	// jsonb_set(metadata, '{thread_id}', to_jsonb(new_thread_id)) and PRESERVES run_id.
-	if _, err := tx.Exec(ctx, `
+	if _, err := ex.Exec(ctx, `
 		INSERT INTO checkpoints
 			(run_id, thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
 		SELECT run_id, $2::uuid, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint,
@@ -442,7 +466,7 @@ func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string)
 		return fmt.Errorf("copy checkpoints: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
+	if _, err := ex.Exec(ctx, `
 		INSERT INTO checkpoint_blobs
 			(thread_id, checkpoint_ns, channel, version, type, blob)
 		SELECT $2::uuid, checkpoint_ns, channel, version, type, blob
@@ -453,7 +477,7 @@ func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string)
 		return fmt.Errorf("copy checkpoint_blobs: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
+	if _, err := ex.Exec(ctx, `
 		INSERT INTO checkpoint_writes
 			(thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, blob, task_path)
 		SELECT $2::uuid, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, blob, task_path
@@ -464,7 +488,7 @@ func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string)
 		return fmt.Errorf("copy checkpoint_writes: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx,
+	if _, err := ex.Exec(ctx,
 		`UPDATE thread
 		    SET state_updated_at = now(),
 		        updated_at       = now()
@@ -474,7 +498,7 @@ func (s *Store) CopyThread(ctx context.Context, fromThreadID, toThreadID string)
 		return fmt.Errorf("bump thread state_updated_at: %w", err)
 	}
 
-	return tx.Commit(ctx)
+	return nil
 }
 
 // Prune deletes checkpoint rows according to the given strategy.

@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumca "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cancel_run_action"
 	enumcs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_control_signal"
 	enumms "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy"
 	enumrs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_run_status"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/config"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	lsdstream "github.com/duongnghia222/langsmith-deployment-go/internal/stream"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -120,16 +123,18 @@ func (s *Service) Stats(ctx context.Context, _ *emptypb.Empty) (*coreapi.RunStat
 // PoolStats implements RunsServer.PoolStats.
 //
 // Postgres mapping:
-//   PoolMax       = MaxConns()    — configured upper bound
-//   PoolSize      = TotalConns()  — currently open connections (idle + acquired + constructing)
-//   PoolAvailable = IdleConns()   — connections ready to use immediately
-//   RequestsQueued = EmptyAcquireCount() — times a caller had to wait because the pool was empty
-//   RequestsErrors = 0            — pgxpool does not expose a connection-error counter
+//
+//	PoolMax       = MaxConns()    — configured upper bound
+//	PoolSize      = TotalConns()  — currently open connections (idle + acquired + constructing)
+//	PoolAvailable = IdleConns()   — connections ready to use immediately
+//	RequestsQueued = EmptyAcquireCount() — times a caller had to wait because the pool was empty
+//	RequestsErrors = 0            — pgxpool does not expose a connection-error counter
 //
 // Redis mapping (via go-redis PoolStats):
-//   IdleConnections  = IdleConns    — connections not currently checked out
-//   InUseConnections = TotalConns - IdleConns
-//   MaxConnections   = TotalConns   — go-redis PoolStats has no separate MaxConns field
+//
+//	IdleConnections  = IdleConns    — connections not currently checked out
+//	InUseConnections = TotalConns - IdleConns
+//	MaxConnections   = TotalConns   — go-redis PoolStats has no separate MaxConns field
 func (s *Service) PoolStats(ctx context.Context, _ *emptypb.Empty) (*coreapi.ConnectionPoolStats, error) {
 	if s.rdb == nil {
 		return nil, status.Error(codes.Unavailable, "redis not configured")
@@ -182,6 +187,10 @@ func mapErr(err error) error {
 	if errors.Is(err, ErrNotFound) {
 		return status.Error(codes.NotFound, err.Error())
 	}
+	// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+	if errors.Is(err, ErrForbidden) {
+		return status.Error(codes.NotFound, err.Error())
+	}
 	return status.Error(codes.Internal, err.Error())
 }
 
@@ -210,9 +219,12 @@ func multitaskTextToEnum(s string) enumms.MultitaskStrategy {
 // Redis RPUSH to the run queue signals workers waiting on BLPOP.
 //
 // (item 1) req.UserId is forwarded to CreateRunInput.UserID for injection into
-//   kwargs.config.configurable.user_id (ops.py:1571 params["user_id"]).
+//
+//	kwargs.config.configurable.user_id (ops.py:1571 params["user_id"]).
+//
 // (item 3) req.IfNotExists is forwarded to CreateRunInput.IfNotExists; when
-//   CREATE_THREAD_IF_THREAD_NOT_EXISTS the store auto-creates the thread.
+//
+//	CREATE_THREAD_IF_THREAD_NOT_EXISTS the store auto-creates the thread.
 func (s *Service) Create(ctx context.Context, req *coreapi.CreateRunRequest) (*coreapi.CreateRunResponse, error) {
 	strategy := req.GetMultitaskStrategy().String()
 	in := CreateRunInput{
@@ -223,23 +235,43 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateRunRequest) (*c
 		Metadata:          req.GetMetadataJson(),
 		MultitaskStrategy: strategy,
 		AfterSeconds:      req.GetAfterSeconds(),
-		UserID:            req.GetUserId(),                       // (item 1)
-		IfNotExists:       int32(req.GetIfNotExists()),           // (item 3)
+		UserID:            req.GetUserId(),             // (item 1)
+		IfNotExists:       int32(req.GetIfNotExists()), // (item 3)
 	}
 	if req.RunId != nil {
 		in.RunID = req.GetRunId().GetValue()
 	}
-	r, err := s.store.Create(ctx, in, req.GetThreadFilters(), req.GetAssistantFilters())
+	// (fix round 1, finding 2) persist encryption_context so a later-claiming
+	// worker (Next, below) can retrieve it — nil stays nil (column stays NULL).
+	if ec := req.GetEncryptionContext(); ec != nil {
+		b, err := jsonbutil.Marshal(ec)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal encryption_context: %v", err)
+		}
+		in.EncryptionContext = b
+	}
+	res, err := s.store.Create(ctx, in, req.GetThreadFilters(), req.GetAssistantFilters())
 	if err != nil {
 		if errors.Is(err, ErrInflight) {
 			return nil, status.Error(codes.AlreadyExists, "run inflight on thread")
 		}
 		return nil, mapErr(err)
 	}
+	r := res.Run
 	// Wake up any worker waiting on BLPOP queue:runs:pending.
 	// Skip for delayed runs — they'll be picked up on the next poll cycle.
 	if s.rdb != nil && in.AfterSeconds == 0 {
 		_ = s.rdb.RPush(ctx, lsdstream.RunQueueKey(), r.RunID).Err()
+	}
+	// (2d) store.Create only reports which runs were displaced by the
+	// multitask strategy — it does not mutate or signal them. Apply exactly
+	// what Cancel would (same signal-publishing path) so a running worker
+	// actually sees the interrupt/rollback and pending rows transition too.
+	if (strategy == "interrupt" || strategy == "rollback") && len(res.InflightRunIDs) > 0 {
+		if results, cerr := s.store.CancelWithAction(ctx, res.InflightRunIDs, r.ThreadID, strategy, nil); cerr == nil {
+			s.publishCancelSignals(ctx, results, strategy)
+			s.publishCancelTerminals(ctx, results)
+		}
 	}
 	return &coreapi.CreateRunResponse{Runs: []*coreapi.Run{toPB(r)}}, nil
 }
@@ -285,7 +317,22 @@ func (s *Service) Cancel(ctx context.Context, req *coreapi.CancelRunRequest) (*e
 		if err != nil {
 			return nil, mapErr(err)
 		}
+		// Signal every matched run before checking for a shortfall (ops.py:1834-1837
+		// publishes for all requested run_ids ahead of the raise at ops.py:1907) —
+		// a run that was actually cancelled must not be left unsignalled just
+		// because a sibling ID in the same request was bogus/already-terminal.
 		s.publishCancelSignals(ctx, results, action)
+		s.publishCancelTerminals(ctx, results) // (2f-ii)
+		// (2f-i) NotFound unless every requested run_id matched a pending/running row.
+		matched := make(map[string]bool, len(results))
+		for _, r := range results {
+			matched[r.RunID] = true
+		}
+		for _, id := range runIDs {
+			if !matched[id] {
+				return nil, status.Error(codes.NotFound, "run not found: "+id)
+			}
+		}
 		return &emptypb.Empty{}, nil
 	}
 	if target := req.GetStatus(); target != nil {
@@ -347,6 +394,20 @@ func (s *Service) publishCancelSignals(ctx context.Context, results []CancelResu
 	}
 }
 
+// publishCancelTerminals publishes to RunTerminalChannel for every result that
+// just reached a terminal run status as a direct effect of this cancel call
+// (rollback-delete, or interrupt on a pending row — see CancelResult.Terminal).
+// This is how Stream consumers learn a run is done when the transition was
+// caused by Cancel/Create's inflight handling rather than a worker's
+// MarkDone/SetStatus (2f-ii, 2d, 2g).
+func (s *Service) publishCancelTerminals(ctx context.Context, results []CancelResult) {
+	for _, r := range results {
+		if r.Terminal {
+			s.publishTerminalDone(ctx, r.RunID)
+		}
+	}
+}
+
 // cancelStatusToRunStatuses maps a CancelRunStatus enum to the set of run.status
 // values it selects. CANCEL_RUN_STATUS_ALL means pending OR running — terminal
 // states (success, error, timeout, interrupted) are never cancelled.
@@ -387,10 +448,12 @@ func (s *Service) SetStatus(ctx context.Context, req *coreapi.SetRunStatusReques
 
 // MarkDone implements RunsServer.MarkDone.
 //
-// (C7) Publish "done" to RunTerminalChannel after DB update, mirroring Python
-// ops.py:1436: `await get_redis().publish(CHANNEL_RUN_CONTROL.format(run_id), "done")`.
+// (2a) MarkDone must not overwrite a terminal status set elsewhere (ops.py:1417-1437):
+// it only releases the lease. Publish "done" to RunTerminalChannel after the DB
+// update, mirroring Python ops.py:1436:
+// `await get_redis().publish(CHANNEL_RUN_CONTROL.format(run_id), "done")`.
 func (s *Service) MarkDone(ctx context.Context, req *coreapi.MarkRunDoneRequest) (*emptypb.Empty, error) {
-	if err := s.store.MarkDone(ctx, req.GetRunId().GetValue(), req.GetResumable()); err != nil {
+	if err := s.store.MarkDone(ctx, req.GetRunId().GetValue()); err != nil {
 		return nil, mapErr(err)
 	}
 	s.publishTerminalDone(ctx, req.GetRunId().GetValue())
@@ -436,10 +499,22 @@ func (s *Service) Next(ctx context.Context, req *coreapi.NextRunRequest) (*corea
 	}
 	resp := &coreapi.NextRunResponse{}
 	for _, c := range claimed {
-		resp.Runs = append(resp.Runs, &coreapi.RunWithAttempt{
+		rwa := &coreapi.RunWithAttempt{
 			Run:     toPB(c.Run),
 			Attempt: c.Attempt,
-		})
+		}
+		// (fix round 1, finding 2) populate from the persisted column; nil/absent
+		// stays unset so extract_encryption_context (Python) sees None, not {}.
+		if len(c.Run.EncryptionContext) > 0 {
+			var ec encryption.EncryptionContext
+			if err := jsonbutil.Unmarshal(c.Run.EncryptionContext, &ec); err != nil {
+				slog.Default().Error("next: unparseable run encryption_context, skipping",
+					"run_id", c.Run.RunID, "err", err)
+			} else {
+				rwa.EncryptionContext = &ec
+			}
+		}
+		resp.Runs = append(resp.Runs, rwa)
 	}
 	return resp, nil
 }
@@ -472,40 +547,59 @@ func (s *Service) Sweep(ctx context.Context, _ *emptypb.Empty) (*coreapi.SweepRu
 // appends the event to both the run stream and the thread stream (best-effort
 // mirror). PublishStreamEventRequest has no Filters field, so auth filters are
 // passed as nil to PublishExistsAndAuth.
+//
+// (2j-i) run_id is optional on the wire; when absent (or "*") this is a
+// thread-level-only publish — run validation and the run stream write are
+// skipped entirely.
+// (2j-ii) A missing run row is not an error: by the time an event is
+// published the run may already be gone (e.g. rolled back). Log at debug and
+// return success instead of NotFound.
 func (s *Service) Publish(ctx context.Context, req *coreapi.PublishStreamEventRequest) (*emptypb.Empty, error) {
 	if s.streamer == nil {
 		return nil, status.Error(codes.Unavailable, "streaming not configured")
 	}
 
-	runID := req.GetRunId().GetValue()
 	threadID := req.GetThreadId().GetValue()
-
-	// Validate UUIDs before hitting the database; a malformed ID would produce
-	// a Postgres "invalid input syntax for type uuid" error (codes.Internal) rather
-	// than the correct codes.InvalidArgument.
-	runUUID, err := uuid.Parse(runID)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid run_id")
-	}
 	threadUUID, err := uuid.Parse(threadID)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid thread_id")
 	}
 
-	// Guard: verify run exists (no auth filters on the Publish RPC).
-	if err := s.store.PublishExistsAndAuth(ctx, runID, threadID, nil); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		if errors.Is(err, ErrForbidden) {
-			return nil, status.Error(codes.PermissionDenied, err.Error())
-		}
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
 	maxLen := int64(1000)
 	if s.cfg != nil && s.cfg.StreamMaxLen > 0 {
 		maxLen = s.cfg.StreamMaxLen
+	}
+
+	runID := req.GetRunId().GetValue()
+	if req.RunId == nil || runID == "" || runID == "*" {
+		// (2j-i) Thread-level publish: no run to validate or write to.
+		fields := map[string]any{
+			"event_type": req.GetEventType(),
+			"message":    req.GetMessage(),
+			"resumable":  fmt.Sprintf("%t", req.GetResumable()),
+		}
+		if _, err := s.streamer.XAdd(ctx, lsdstream.ThreadStreamKey(threadUUID), fields, maxLen); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("xadd thread stream: %v", err))
+		}
+		return &emptypb.Empty{}, nil
+	}
+
+	// Validate the run_id UUID before hitting the database; a malformed ID
+	// would produce a Postgres "invalid input syntax for type uuid" error
+	// (codes.Internal) rather than the correct codes.InvalidArgument.
+	runUUID, err := uuid.Parse(runID)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid run_id")
+	}
+
+	// Guard: verify run exists (no auth filters on the Publish RPC).
+	if err := s.store.PublishExistsAndAuth(ctx, runID, threadID, nil); err != nil {
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrForbidden) {
+			// (2j-ii) swallow: run already gone, nothing left to publish to.
+			slog.Default().Debug("publish: run not found, skipping", "run_id", runID)
+			return &emptypb.Empty{}, nil
+		}
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	fields := map[string]any{
@@ -565,13 +659,18 @@ func (s *Service) Enter(req *coreapi.EnterRunRequest, stream coreapi.Runs_EnterS
 	// (C6) Check for a pre-existing cancel signal in the Redis STRING key
 	// (set by Cancel with 60s TTL). A late-starting worker sees the cancel
 	// even if it missed the PUBLISH. Mirrors Python ops.py:2432-2436.
+	//
+	// (2l) Do NOT return after sending it: Python's listen_for_cancellation
+	// sends the signal and falls through to keep listening/heartbeating
+	// (ops.py:2432-2436 has no early return). Returning here would tear down
+	// the heartbeat goroutine before it starts, letting the lease expire out
+	// from under a worker that is still running.
 	if s.rdb != nil {
 		if val, err := s.rdb.Get(ctx, controlChannel).Result(); err == nil && val != "" {
 			action := parseControlSignal(val)
 			if err := stream.Send(&coreapi.ControlEvent{Action: action}); err != nil {
 				return err
 			}
-			return nil
 		}
 	}
 
@@ -583,6 +682,10 @@ func (s *Service) Enter(req *coreapi.EnterRunRequest, stream coreapi.Runs_EnterS
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
+	// (2l) ops.py:2618-2622 heartbeat: transient errors are logged and the loop
+	// keeps going; only a definitively lost lease (ExtendLease's UPDATE
+	// matched 0 rows because the run is no longer 'running' — reassigned,
+	// swept, or finished) aborts the stream.
 	heartbeatErrCh := make(chan error, 1)
 	go func() {
 		for {
@@ -591,8 +694,11 @@ func (s *Service) Enter(req *coreapi.EnterRunRequest, stream coreapi.Runs_EnterS
 				return
 			case <-ticker.C:
 				if err := s.store.ExtendLease(ctx, runID, ""); err != nil {
-					heartbeatErrCh <- err
-					return
+					if errors.Is(err, ErrNotFound) {
+						heartbeatErrCh <- err
+						return
+					}
+					slog.Default().Warn("heartbeat: ExtendLease failed, retrying", "run_id", runID, "error", err)
 				}
 			}
 		}
@@ -649,43 +755,6 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 		return status.Error(codes.InvalidArgument, "invalid run_id")
 	}
 
-	streamCh := make(chan lsdstream.Entry, 256)
-	bufCtx, bufCancel := context.WithCancel(ctx)
-	defer bufCancel()
-
-	replayBatch := int64(100)
-	if s.cfg != nil && s.cfg.StreamReplayBatch > 0 {
-		replayBatch = s.cfg.StreamReplayBatch
-	}
-	blockMs := 500
-	if s.cfg != nil && s.cfg.StreamReadBlockMs > 0 {
-		blockMs = s.cfg.StreamReadBlockMs
-	}
-
-	go func() {
-		defer close(streamCh)
-		cursor := "0-0"
-		for {
-			select {
-			case <-bufCtx.Done():
-				return
-			default:
-			}
-			entries, err := s.streamer.XReadFrom(bufCtx, lsdstream.RunStreamKey(runUUID), cursor, replayBatch, blockMs)
-			if err != nil {
-				return
-			}
-			for _, e := range entries {
-				cursor = e.ID
-				select {
-				case streamCh <- e:
-				case <-bufCtx.Done():
-					return
-				}
-			}
-		}
-	}()
-
 	termSub, err := s.streamer.Subscribe(ctx, lsdstream.RunTerminalChannel(runUUID))
 	if err != nil {
 		return status.Error(codes.Internal, fmt.Sprintf("subscribe terminal: %v", err))
@@ -712,7 +781,8 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 	if err := s.store.PublishExistsAndAuth(ctx, runID, threadID, joinReq.GetFilters()); err != nil {
 		switch {
 		case errors.Is(err, ErrForbidden):
-			return status.Error(codes.PermissionDenied, err.Error())
+			// ops.py always surfaces 404 for auth-filter exclusion (ops.py:2018, 2280).
+			return status.Error(codes.NotFound, err.Error())
 		case errors.Is(err, ErrNotFound):
 			if !joinReq.GetIgnoreRunNotFound() {
 				return status.Error(codes.NotFound, err.Error())
@@ -730,16 +800,161 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 
 	cancelOnDisconnect := joinReq.GetCancelOnDisconnect()
 
+	// (2h) Build the stream_modes filter. Empty/unset means "all modes"
+	// (ops.py:2057-2060 subscribes to every mode via pattern match when
+	// stream_mode is None); StreamMode's .String() values ("values",
+	// "updates", ...) match the plain event_type strings XAdd writes.
+	var modeFilter map[string]bool
+	if modes := joinReq.GetStreamModes(); len(modes) > 0 {
+		modeFilter = make(map[string]bool, len(modes))
+		for _, m := range modes {
+			modeFilter[m.String()] = true
+		}
+	}
+
+	// (2i) No history replay by default: tail from the stream's current end
+	// unless the client supplied last_event_id to resume from. This must be
+	// computed here, after last_event_id is known from the JoinRunRequest,
+	// not before.
+	//
+	// Resolve the tail to a concrete ID ONCE rather than passing the "$"
+	// sentinel into the blocking read loop below: Redis resolves "$" to "the
+	// stream's current last ID" at command-processing time on every XREAD
+	// call, so a client that re-issues "$" on each blocking-timeout re-arm
+	// can silently miss entries appended in the gap between one call
+	// returning and the next being processed. Falling back to "0-0" (full
+	// replay) on error is the safe direction — over-delivery, never a gap.
+	cursor := lastEventID
+	if cursor == "" {
+		var err error
+		cursor, err = s.streamer.LastID(ctx, lsdstream.RunStreamKey(runUUID))
+		if err != nil {
+			cursor = "0-0"
+		}
+	}
+
+	replayBatch := int64(100)
+	if s.cfg != nil && s.cfg.StreamReplayBatch > 0 {
+		replayBatch = s.cfg.StreamReplayBatch
+	}
+	blockMs := 500
+	if s.cfg != nil && s.cfg.StreamReadBlockMs > 0 {
+		blockMs = s.cfg.StreamReadBlockMs
+	}
+
+	streamCh := make(chan lsdstream.Entry, 256)
+	bufCtx, bufCancel := context.WithCancel(ctx)
+	defer bufCancel()
+	go func() {
+		defer close(streamCh)
+		for {
+			select {
+			case <-bufCtx.Done():
+				return
+			default:
+			}
+			entries, err := s.streamer.XReadFrom(bufCtx, lsdstream.RunStreamKey(runUUID), cursor, replayBatch, blockMs)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				cursor = e.ID
+				select {
+				case streamCh <- e:
+				case <-bufCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	// sendEntry applies the (2h) stream_modes filter and forwards a stream
+	// entry to the client. Redis's XREAD is exclusive of the fromID, so no
+	// separate lastEventID<=entry.ID skip is needed here (2i).
+	sendEntry := func(entry lsdstream.Entry) error {
+		eventType, _ := entry.Fields["event_type"].(string)
+		if modeFilter != nil && !modeFilter[eventType] {
+			return nil
+		}
+		var msgBytes []byte
+		switch v := entry.Fields["message"].(type) {
+		case []byte:
+			msgBytes = v
+		case string:
+			msgBytes = []byte(v)
+		}
+		streamID := entry.ID
+		return grpcStream.Send(&coreapi.StreamEvent{
+			EventType: eventType,
+			Message:   msgBytes,
+			StreamId:  &streamID,
+		})
+	}
+
+	// (2e) checkRunFinished polls run status the way ops.py's join loop does
+	// (ops.py:2104-2112): once the run is missing or no longer pending/running,
+	// the stream must not keep blocking on entries/terminal-pubsub that may
+	// never arrive — e.g. the run was already terminal before Join.
+	checkRunFinished := func() bool {
+		run, err := s.store.Get(ctx, runID, threadID, nil)
+		if err != nil {
+			return true
+		}
+		return run.Status != "pending" && run.Status != "running"
+	}
+	// drainAndClose flushes whatever is already buffered for a short grace
+	// window (DRAIN_TIMEOUT, ops.py:95) then closes. No synthetic event is
+	// sent on this path — only the terminal pubsub channel produces "done".
+	drainAndClose := func() error {
+		drainCtx, drainCancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		defer drainCancel()
+		for {
+			select {
+			case entry, ok := <-streamCh:
+				if !ok {
+					return nil
+				}
+				if err := sendEntry(entry); err != nil {
+					return err
+				}
+			case <-drainCtx.Done():
+				return nil
+			}
+		}
+	}
+
+	if checkRunFinished() {
+		return drainAndClose()
+	}
+
+	// (2e) WAIT_TIMEOUT (ops.py:94): re-check run status periodically so a
+	// terminal transition that never publishes to RunTerminalChannel (or that
+	// was missed) still ends the stream promptly.
+	statusTicker := time.NewTicker(5 * time.Second)
+	defer statusTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			// (2g) Signal the run the same way Cancel does — a bare
+			// store.Cancel only updates the DB and never wakes a running
+			// worker; publishCancelSignals is what actually delivers the
+			// interrupt.
 			if cancelOnDisconnect {
 				// Use a fresh context — ctx is already cancelled.
 				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_, _ = s.store.Cancel(cctx, []string{runID}, threadID, nil)
+				if results, cerr := s.store.CancelWithAction(cctx, []string{runID}, threadID, "interrupt", nil); cerr == nil {
+					s.publishCancelSignals(cctx, results, "interrupt")
+					s.publishCancelTerminals(cctx, results)
+				}
 				ccancel()
 			}
 			return ctx.Err()
+
+		case <-statusTicker.C:
+			if checkRunFinished() {
+				return drainAndClose()
+			}
 
 		case _, ok := <-termSub.Channel():
 			if !ok {
@@ -755,23 +970,7 @@ func (s *Service) Stream(grpcStream coreapi.Runs_StreamServer) error {
 			if !ok {
 				return nil
 			}
-			if lastEventID != "" && entry.ID <= lastEventID {
-				continue
-			}
-			eventType, _ := entry.Fields["event_type"].(string)
-			var msgBytes []byte
-			switch v := entry.Fields["message"].(type) {
-			case []byte:
-				msgBytes = v
-			case string:
-				msgBytes = []byte(v)
-			}
-			streamID := entry.ID
-			if err := grpcStream.Send(&coreapi.StreamEvent{
-				EventType: eventType,
-				Message:   msgBytes,
-				StreamId:  &streamID,
-			}); err != nil {
+			if err := sendEntry(entry); err != nil {
 				return err
 			}
 		}

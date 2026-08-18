@@ -13,7 +13,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// validKey rejects anything that could break out of a JSONB ->> 'key' literal.
+// validKey is used only by ValidateKey (the Cache service's key validation).
+// The filter emitters below no longer need it: the key is always bound as a
+// parameter now, never inlined into the SQL string, so it can't break out of
+// a literal (ops.py accepts any key).
 var validKey = regexp.MustCompile(`^[A-Za-z0-9_.\-]+$`)
 
 // ApplyToQuery converts filters into an SQL fragment and the corresponding
@@ -54,17 +57,23 @@ func emit(f *pb.AuthFilter, col string, idx int) (string, []any, int, error) {
 	}
 	switch v := f.Filter.(type) {
 	case *pb.AuthFilter_Eq:
-		if !validKey.MatchString(v.Eq.Key) {
-			return "", nil, idx, fmt.Errorf("auth: invalid filter key %q", v.Eq.Key)
+		if v.Eq.Key == "" {
+			return "", nil, idx, fmt.Errorf("auth: empty filter key")
 		}
-		return fmt.Sprintf("((%s->>'%s') = $%d)", col, v.Eq.Key, idx),
-			[]any{v.Eq.Match}, idx + 1, nil
+		// ops.py:2688 — metadata @> '{"k": <v>}'::jsonb (containment, not text equality).
+		return fmt.Sprintf("(%s @> jsonb_build_object($%d::text, $%d::jsonb))", col, idx, idx+1),
+			[]any{v.Eq.Key, v.Eq.Match}, idx + 2, nil
 	case *pb.AuthFilter_Contains:
-		if !validKey.MatchString(v.Contains.Key) {
-			return "", nil, idx, fmt.Errorf("auth: invalid filter key %q", v.Contains.Key)
+		if v.Contains.Key == "" {
+			return "", nil, idx, fmt.Errorf("auth: empty filter key")
 		}
-		return fmt.Sprintf("((%s->>'%s') = ANY($%d::text[]))", col, v.Contains.Key, idx),
-			[]any{v.Contains.Matches}, idx + 1, nil
+		// Client always sends the whole value (scalar or list) as ONE JSON string.
+		if len(v.Contains.Matches) != 1 {
+			return "", nil, idx, fmt.Errorf("auth: contains filter requires exactly one match value, got %d", len(v.Contains.Matches))
+		}
+		// ops.py:2694-2700 — ((metadata -> 'k')::jsonb) @> to_jsonb(v).
+		return fmt.Sprintf("((%s -> $%d::text) @> $%d::jsonb)", col, idx, idx+1),
+			[]any{v.Contains.Key, v.Contains.Matches[0]}, idx + 2, nil
 	case *pb.AuthFilter_OrFilter:
 		return joinNested(v.OrFilter.Filters, col, idx, " OR ")
 	case *pb.AuthFilter_AndFilter:

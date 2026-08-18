@@ -3,15 +3,18 @@ package runs_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"reflect"
 	"testing"
 	"time"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
+	"github.com/duongnghia222/langsmith-deployment-go/gen/encryption"
 	enumca "github.com/duongnghia222/langsmith-deployment-go/gen/enum_cancel_run_action"
 	enumms "github.com/duongnghia222/langsmith-deployment-go/gen/enum_multitask_strategy"
 	enumrs "github.com/duongnghia222/langsmith-deployment-go/gen/enum_run_status"
+	enumsm "github.com/duongnghia222/langsmith-deployment-go/gen/enum_stream_mode"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/config"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/db"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/runs"
@@ -294,6 +297,162 @@ func TestRunService_Create_Enqueue_TwoRuns(t *testing.T) {
 	}
 }
 
+// TestRunService_Create_EncryptionContextRoundTripsThroughNext is fix round 1,
+// finding 2: encryption_context must be persisted on Create and populated back
+// onto RunWithAttempt when Next() claims the run, so a later-claiming async
+// worker (api/grpc/ops/runs.py's next()) can retrieve it.
+func TestRunService_Create_EncryptionContextRoundTripsThroughNext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+	thID := "55555555-5555-5555-5555-555555555555"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+
+	ec := &encryption.EncryptionContext{Metadata: map[string][]byte{"tenant_id": []byte(`"abc"`)}}
+	created, err := svc.Create(ctx, &coreapi.CreateRunRequest{
+		ThreadId:          &coreapi.UUID{Value: thID},
+		AssistantId:       &coreapi.UUID{Value: aID},
+		KwargsJson:        []byte(`{}`),
+		EncryptionContext: ec,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	runID := created.GetRuns()[0].GetRunId().GetValue()
+
+	next, err := svc.Next(ctx, &coreapi.NextRunRequest{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(next.GetRuns()) != 1 || next.GetRuns()[0].GetRun().GetRunId().GetValue() != runID {
+		t.Fatalf("Next: got %d runs, want 1 matching %s", len(next.GetRuns()), runID)
+	}
+	got := next.GetRuns()[0].GetEncryptionContext()
+	if got == nil {
+		t.Fatal("RunWithAttempt.EncryptionContext = nil, want populated from the persisted column")
+	}
+	if string(got.GetMetadata()["tenant_id"]) != `"abc"` {
+		t.Errorf("EncryptionContext.metadata[tenant_id] = %q, want %q", got.GetMetadata()["tenant_id"], `"abc"`)
+	}
+}
+
+// TestRunService_Create_EncryptionContextAbsent_NextLeavesItUnset is fix round
+// 1, finding 2's absence case: a run created without an encryption context
+// must come back from Next() with the field genuinely unset (nil), not an
+// empty message — Python's extract_encryption_context (finding 1) only falls
+// back to the blob-marker path when it sees None.
+func TestRunService_Create_EncryptionContextAbsent_NextLeavesItUnset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g1", nil)
+	thID := "66666666-6666-6666-6666-666666666666"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+
+	created, err := svc.Create(ctx, &coreapi.CreateRunRequest{
+		ThreadId:    &coreapi.UUID{Value: thID},
+		AssistantId: &coreapi.UUID{Value: aID},
+		KwargsJson:  []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	runID := created.GetRuns()[0].GetRunId().GetValue()
+
+	next, err := svc.Next(ctx, &coreapi.NextRunRequest{})
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(next.GetRuns()) != 1 || next.GetRuns()[0].GetRun().GetRunId().GetValue() != runID {
+		t.Fatalf("Next: got %d runs, want 1 matching %s", len(next.GetRuns()), runID)
+	}
+	if next.GetRuns()[0].EncryptionContext != nil {
+		t.Errorf("RunWithAttempt.EncryptionContext = %v, want nil (unset)", next.GetRuns()[0].EncryptionContext)
+	}
+}
+
+// TestRunService_Create_Interrupt_SignalsExistingRuns verifies 2d: store.Create
+// only reports which runs were displaced by the multitask strategy — it is
+// service.Create's job to apply exactly what Cancel would: a displaced pending
+// run transitions to 'interrupted', and a displaced running run gets the same
+// control-channel PUBLISH a Cancel RPC would send (so the worker actually
+// wakes up, not just a DB row that nobody is listening for).
+func TestRunService_Create_Interrupt_SignalsExistingRuns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rdb := startRedis(t, ctx)
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-create-interrupt", nil)
+	thID := "44444444-4444-4444-4444-444444444444"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	pendingID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+	runningID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+
+	streamer := lsdstream.NewStreamer(rdb)
+	cfg := &config.Config{StreamMaxLen: 1000}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	runningUUID := uuid.MustParse(runningID)
+	controlCh := lsdstream.RunControlChannel(runningUUID)
+	sub := rdb.Subscribe(ctx, controlCh)
+	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe control: %v", err)
+	}
+	msgCh := sub.Channel()
+
+	interruptStrategy := enumms.MultitaskStrategy_interrupt
+	resp, err := svc.Create(ctx, &coreapi.CreateRunRequest{
+		ThreadId:          &coreapi.UUID{Value: thID},
+		AssistantId:       &coreapi.UUID{Value: aID},
+		MultitaskStrategy: &interruptStrategy,
+		KwargsJson:        []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Create (interrupt): %v", err)
+	}
+	if resp.GetRuns()[0].GetRunId().GetValue() == "" {
+		t.Fatal("new run ID empty")
+	}
+
+	// The pending run must have transitioned to 'interrupted'.
+	var pendingStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM run WHERE run_id = $1::uuid`, pendingID).Scan(&pendingStatus); err != nil {
+		t.Fatalf("select pending status: %v", err)
+	}
+	if pendingStatus != "interrupted" {
+		t.Errorf("pending run status = %q, want interrupted", pendingStatus)
+	}
+
+	// The running run must receive the control signal (worker wakes up).
+	select {
+	case msg := <-msgCh:
+		if msg.Payload == "" {
+			t.Error("received empty payload on running run's control channel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control signal on displaced running run")
+	}
+}
+
 func TestService_KwargsRoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -424,6 +583,34 @@ func TestRunService_Cancel_RunIds(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Cancel: %v", err)
+	}
+}
+
+// TestRunService_Cancel_RunIds_NotFoundOnUnmatched asserts 2f-i: Cancel must
+// raise NotFound unless every requested run_id matched a pending/running row.
+// One of the two IDs here is already terminal ("success"), so it can never
+// match — the whole call must fail even though the other ID is cancellable.
+func TestRunService_Cancel_RunIds_NotFoundOnUnmatched(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "g-cancel-notfound", nil)
+	thID := "5b5b5b5b-5b5b-5b5b-5b5b-5b5b5b5b5b5b"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	pendingID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "pending")
+	terminalID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "success")
+
+	_, err := svc.Cancel(ctx, &coreapi.CancelRunRequest{
+		Target: &coreapi.CancelRunRequest_RunIds{
+			RunIds: &coreapi.CancelRunIdsTarget{
+				RunIds: []*coreapi.UUID{{Value: pendingID}, {Value: terminalID}},
+			},
+		},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("err code = %s, want NotFound", status.Code(err))
 	}
 }
 
@@ -603,7 +790,10 @@ func TestPublish_AppendsToRedisStreams(t *testing.T) {
 	}
 }
 
-func TestPublish_NotFoundOnMissingRun(t *testing.T) {
+// TestPublish_SucceedsOnMissingRun asserts 2j-ii: by the time an event is
+// published the run row may already be gone (e.g. rolled back); Publish must
+// swallow that and return success rather than surfacing NotFound.
+func TestPublish_SucceedsOnMissingRun(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -647,11 +837,66 @@ func TestPublish_NotFoundOnMissingRun(t *testing.T) {
 		EventType: "values",
 		Message:   []byte(`{}`),
 	})
-	if err == nil {
-		t.Fatal("expected NotFound, got nil")
+	if err != nil {
+		t.Fatalf("Publish on missing run: expected success (2j-ii), got %v", err)
 	}
-	if status.Code(err) != codes.NotFound {
-		t.Errorf("expected codes.NotFound, got %v: %v", status.Code(err), err)
+}
+
+// TestPublish_ThreadLevelOnly asserts 2j-i: an absent (or "*") run_id skips
+// run validation entirely and writes only to the thread-level stream — no
+// run row needs to exist at all.
+func TestPublish_ThreadLevelOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx := context.Background()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+	cfg := &config.Config{StreamMaxLen: 1000}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	threadID := "33333333-3333-3333-3333-333333333333"
+	_, err = coreapi.NewRunsClient(conn).Publish(ctx, &coreapi.PublishStreamEventRequest{
+		ThreadId:  &coreapi.UUID{Value: threadID},
+		EventType: "values",
+		Message:   []byte(`{"key":"value"}`),
+	})
+	if err != nil {
+		t.Fatalf("Publish (thread-level only): %v", err)
+	}
+
+	threadStreamKey := lsdstream.ThreadStreamKey(uuid.MustParse(threadID))
+	entries, err := streamer.XReadFrom(ctx, threadStreamKey, "0-0", 10, 0)
+	if err != nil {
+		t.Fatalf("XReadFrom thread stream: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("thread stream len = %d, want 1", len(entries))
 	}
 }
 
@@ -1059,6 +1304,107 @@ func TestStream_CancelOnDisconnect(t *testing.T) {
 	}
 }
 
+// TestStream_CancelOnDisconnect_PublishesSignal verifies 2g: disconnecting
+// with cancel_on_disconnect must go through the same signal-publishing path
+// as the Cancel RPC (control channel PUBLISH), not just update the DB — a
+// bare store.Cancel call never wakes a running worker.
+func TestStream_CancelOnDisconnect_PublishesSignal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+
+	assistantID := testdb.MustInsertAssistant(t, ctx, pool, "stream-cancel-signal", nil)
+	threadID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbc"
+	testdb.MustInsertThread(t, ctx, pool, threadID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, threadID, assistantID, "running")
+
+	cfg := &config.Config{
+		StreamMaxLen:      1000,
+		StreamReadBlockMs: 500,
+		StreamReplayBatch: 100,
+	}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	runUUID := uuid.MustParse(runID)
+	controlCh := lsdstream.RunControlChannel(runUUID)
+	sub := rdb.Subscribe(ctx, controlCh)
+	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe control: %v", err)
+	}
+	msgCh := sub.Channel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go srv.Serve(lis) //nolint:errcheck
+	t.Cleanup(func() { srv.GracefulStop() })
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+
+	bidiStream, err := coreapi.NewRunsClient(conn).Stream(streamCtx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Subscribe{
+			Subscribe: &coreapi.SubscribeRunRequest{
+				RunId:    &coreapi.UUID{Value: runID},
+				ThreadId: &coreapi.UUID{Value: threadID},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Subscribe: %v", err)
+	}
+	if _, err := bidiStream.Recv(); err != nil {
+		t.Fatalf("Recv subscribed: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Join{
+			Join: &coreapi.JoinRunRequest{CancelOnDisconnect: true},
+		},
+	}); err != nil {
+		t.Fatalf("Send Join: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	streamCancel()
+
+	select {
+	case msg := <-msgCh:
+		if msg.Payload == "" {
+			t.Error("received empty payload on control channel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control channel signal after disconnect")
+	}
+}
+
 func TestStream_LastEventIDResume(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1186,6 +1532,348 @@ func TestStream_LastEventIDResume(t *testing.T) {
 	}
 }
 
+// TestStream_JoinAlreadyTerminalRun_EndsPromptly verifies (2e): joining a run
+// that is already in a terminal status must close the stream immediately via
+// the pre-loop checkRunFinished/drainAndClose path, not wait out the 5s
+// statusTicker or block forever on the control/event channels.
+func TestStream_JoinAlreadyTerminalRun_EndsPromptly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+
+	assistantID := testdb.MustInsertAssistant(t, ctx, pool, "stream-already-done", nil)
+	threadID := "dddddddd-eeee-eeee-eeee-dddddddddddd"
+	testdb.MustInsertThread(t, ctx, pool, threadID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, threadID, assistantID, "success")
+
+	cfg := &config.Config{
+		StreamMaxLen:      1000,
+		StreamReadBlockMs: 500,
+		StreamReplayBatch: 100,
+	}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go srv.Serve(lis) //nolint:errcheck
+	t.Cleanup(func() { srv.GracefulStop() })
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer streamCancel()
+
+	bidiStream, err := coreapi.NewRunsClient(conn).Stream(streamCtx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Subscribe{
+			Subscribe: &coreapi.SubscribeRunRequest{
+				RunId:    &coreapi.UUID{Value: runID},
+				ThreadId: &coreapi.UUID{Value: threadID},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Subscribe: %v", err)
+	}
+	if _, err := bidiStream.Recv(); err != nil {
+		t.Fatalf("Recv subscribed: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Join{
+			Join: &coreapi.JoinRunRequest{},
+		},
+	}); err != nil {
+		t.Fatalf("Send Join: %v", err)
+	}
+
+	start := time.Now()
+	_, recvErr := bidiStream.Recv()
+	elapsed := time.Since(start)
+
+	if recvErr != io.EOF {
+		t.Fatalf("Recv after join on terminal run: got err=%v, want io.EOF", recvErr)
+	}
+	if elapsed >= 3*time.Second {
+		t.Errorf("stream took %v to close on an already-terminal run; want well under the 5s statusTicker", elapsed)
+	}
+}
+
+// TestStream_HonorsStreamModes verifies (2h): JoinRunRequest.StreamModes must
+// filter streamed entries server-side by event_type before sending — events
+// published under a mode not in the requested set must never reach the client.
+func TestStream_HonorsStreamModes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+
+	assistantID := testdb.MustInsertAssistant(t, ctx, pool, "stream-modes", nil)
+	threadID := "eeeeeeee-ffff-ffff-ffff-eeeeeeeeeeee"
+	testdb.MustInsertThread(t, ctx, pool, threadID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, threadID, assistantID, "running")
+	runUUID := uuid.MustParse(runID)
+
+	cfg := &config.Config{
+		StreamMaxLen:      1000,
+		StreamReadBlockMs: 500,
+		StreamReplayBatch: 100,
+	}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go srv.Serve(lis) //nolint:errcheck
+	t.Cleanup(func() { srv.GracefulStop() })
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer streamCancel()
+
+	bidiStream, err := coreapi.NewRunsClient(conn).Stream(streamCtx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Subscribe{
+			Subscribe: &coreapi.SubscribeRunRequest{
+				RunId:    &coreapi.UUID{Value: runID},
+				ThreadId: &coreapi.UUID{Value: threadID},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Subscribe: %v", err)
+	}
+	if _, err := bidiStream.Recv(); err != nil {
+		t.Fatalf("Recv subscribed: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Join{
+			Join: &coreapi.JoinRunRequest{
+				StreamModes: []enumsm.StreamMode{enumsm.StreamMode_updates},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Join: %v", err)
+	}
+
+	// Side goroutine: after Join's read-loop has started (cursor resolved at
+	// "$"), publish one event of each mode, then the terminal control signal.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "values",
+			"message":    `{"seq":1}`,
+		}, 1000)
+		_, _ = streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "updates",
+			"message":    `{"seq":2}`,
+		}, 1000)
+		time.Sleep(300 * time.Millisecond)
+		_ = streamer.Publish(ctx, lsdstream.RunTerminalChannel(runUUID), []byte("done"))
+	}()
+
+	var receivedEventTypes []string
+	for {
+		ev, err := bidiStream.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if ev.GetEventType() == "control" && string(ev.GetMessage()) == "done" {
+			break
+		}
+		receivedEventTypes = append(receivedEventTypes, ev.GetEventType())
+	}
+
+	if len(receivedEventTypes) != 1 {
+		t.Fatalf("received %d events, want 1 (mode-filtered); types: %v", len(receivedEventTypes), receivedEventTypes)
+	}
+	if receivedEventTypes[0] != "updates" {
+		t.Errorf("received event_type = %q, want %q", receivedEventTypes[0], "updates")
+	}
+}
+
+// TestStream_JoinWithoutLastEventID_NoHistoryReplay is the plan-mandated
+// regression test for (2i), and a fix-round-1 regression test for finding 2:
+// publish 3 events, then subscribe+join WITHOUT last_event_id, then publish
+// more events afterward — only the events published AFTER Join must arrive.
+// The 3 pre-existing events are written and confirmed BEFORE Join is even
+// sent, so if Join's initial cursor were resolved by handing the literal "$"
+// sentinel into a repeatedly re-armed blocking XREAD (the old, buggy
+// behavior), the fix under test — resolving the tail to a concrete ID ONCE
+// via Streamer.LastID before the buffer goroutine starts — is what this test
+// pins down: it proves no history leaks through and (by construction, since
+// the post-join event is appended only after a real network round trip) no
+// entry is skipped either.
+func TestStream_JoinWithoutLastEventID_NoHistoryReplay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	rdb := startRedis(t, ctx)
+	streamer := lsdstream.NewStreamer(rdb)
+
+	assistantID := testdb.MustInsertAssistant(t, ctx, pool, "stream-no-replay", nil)
+	threadID := "ffffffff-0000-0000-0000-ffffffffffff"
+	testdb.MustInsertThread(t, ctx, pool, threadID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, threadID, assistantID, "running")
+	runUUID := uuid.MustParse(runID)
+
+	cfg := &config.Config{
+		StreamMaxLen:      1000,
+		StreamReadBlockMs: 500,
+		StreamReplayBatch: 100,
+	}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	// Pre-existing history: 3 events written and confirmed BEFORE Join is
+	// ever sent (Subscribe below has not even happened yet).
+	for _, seq := range []string{`{"seq":1}`, `{"seq":2}`, `{"seq":3}`} {
+		if _, err := streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "updates",
+			"message":    seq,
+		}, 1000); err != nil {
+			t.Fatalf("XAdd pre-join entry: %v", err)
+		}
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := server.New(server.Deps{Runs: svc})
+	go srv.Serve(lis) //nolint:errcheck
+	t.Cleanup(func() { srv.GracefulStop() })
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer streamCancel()
+
+	bidiStream, err := coreapi.NewRunsClient(conn).Stream(streamCtx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Subscribe{
+			Subscribe: &coreapi.SubscribeRunRequest{
+				RunId:    &coreapi.UUID{Value: runID},
+				ThreadId: &coreapi.UUID{Value: threadID},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Subscribe: %v", err)
+	}
+	if _, err := bidiStream.Recv(); err != nil {
+		t.Fatalf("Recv subscribed: %v", err)
+	}
+
+	// Join with no last_event_id: must NOT replay the 3 pre-existing events.
+	if err := bidiStream.Send(&coreapi.StreamRunClientMessage{
+		Message: &coreapi.StreamRunClientMessage_Join{
+			Join: &coreapi.JoinRunRequest{},
+		},
+	}); err != nil {
+		t.Fatalf("Send Join: %v", err)
+	}
+
+	// Side goroutine: publish one new event after Join, then terminal.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = streamer.XAdd(ctx, lsdstream.RunStreamKey(runUUID), map[string]any{
+			"event_type": "updates",
+			"message":    `{"seq":4}`,
+		}, 1000)
+		time.Sleep(300 * time.Millisecond)
+		_ = streamer.Publish(ctx, lsdstream.RunTerminalChannel(runUUID), []byte("done"))
+	}()
+
+	var receivedMessages []string
+	for {
+		ev, err := bidiStream.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if ev.GetEventType() == "control" && string(ev.GetMessage()) == "done" {
+			break
+		}
+		receivedMessages = append(receivedMessages, string(ev.GetMessage()))
+	}
+
+	if len(receivedMessages) != 1 {
+		t.Fatalf("received %d events, want 1 (only post-join); messages: %v", len(receivedMessages), receivedMessages)
+	}
+	if receivedMessages[0] != `{"seq":4}` {
+		t.Errorf("received message = %q, want post-join seq 4 (pre-existing history must not replay)", receivedMessages[0])
+	}
+}
+
 // ─── Parity gap tests (C6, C7, C8, C9) ──────────────────────────────────────
 
 // TestCancel_PublishesControlSignal verifies C6 parity:
@@ -1255,6 +1943,78 @@ func TestCancel_PublishesControlSignal(t *testing.T) {
 	ttl := rdb.TTL(ctx, controlCh).Val()
 	if ttl <= 0 || ttl > 60*time.Second {
 		t.Errorf("control key TTL = %v, want (0, 60s]", ttl)
+	}
+}
+
+// TestCancel_PublishesSignalForMatchedRun_EvenWhenBatchHasUnmatchedID is a
+// fix-round-1 regression test (finding 1): a mixed Cancel run_ids batch — one
+// live/matched run plus one bogus/already-terminal ID — must still publish
+// the control signal for the matched run before the NotFound shortfall check
+// runs, exactly like ops.py (ops.py:1834-1837 SETs+PUBLISHes for every
+// requested run_id before the SQL runs; the raise at ops.py:1907 only aborts
+// the caller's transaction, not the signal that already went out). The
+// service must not silently swallow a live run's signal just because a
+// sibling ID in the same request was bogus.
+func TestCancel_PublishesSignalForMatchedRun_EvenWhenBatchHasUnmatchedID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	rdb := startRedis(t, ctx)
+	dsn := testdb.Start(t, ctx)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := db.Migrate(pool, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "cancel-mixed-batch", nil)
+	thID := "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	runningID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+	terminalID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "success")
+
+	streamer := lsdstream.NewStreamer(rdb)
+	cfg := &config.Config{StreamMaxLen: 1000}
+	svc := runs.NewServiceWithStream(pool, rdb, streamer, cfg)
+
+	runUUID := uuid.MustParse(runningID)
+	controlCh := lsdstream.RunControlChannel(runUUID)
+
+	// Subscribe to the matched (still-live) run's control channel BEFORE
+	// calling Cancel so we catch the PUBLISH even though the overall call
+	// will fail with NotFound because of the sibling bogus/terminal ID.
+	sub := rdb.Subscribe(ctx, controlCh)
+	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		t.Fatalf("Subscribe receive: %v", err)
+	}
+	msgCh := sub.Channel()
+
+	_, err = svc.Cancel(ctx, &coreapi.CancelRunRequest{
+		Target: &coreapi.CancelRunRequest_RunIds{
+			RunIds: &coreapi.CancelRunIdsTarget{
+				RunIds: []*coreapi.UUID{{Value: runningID}, {Value: terminalID}},
+			},
+		},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("err code = %s, want NotFound", status.Code(err))
+	}
+
+	// The live run must still have been signalled despite the overall NotFound.
+	select {
+	case msg := <-msgCh:
+		if msg.Payload == "" {
+			t.Error("received empty payload on control channel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control channel message; matched run was not signalled before the NotFound shortfall check")
 	}
 }
 
@@ -1366,6 +2126,44 @@ func TestMarkDone_PublishesTerminalDone(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for terminal channel message")
+	}
+}
+
+// TestMarkDone_DoesNotOverwriteTerminalStatus verifies 2a via the service
+// layer: MarkDone must not set the run's status (regardless of Resumable),
+// only release the lease. Whatever set the terminal status (SetStatus)
+// remains the sole source of truth for it.
+func TestMarkDone_DoesNotOverwriteTerminalStatus(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx := context.Background()
+	svc, pool := newTestService(t, ctx, nil)
+	aID := testdb.MustInsertAssistant(t, ctx, pool, "graph-markdone-noclobber", nil)
+	thID := "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c4"
+	testdb.MustInsertThread(t, ctx, pool, thID, nil)
+	runID := testdb.MustInsertRun(t, ctx, pool, thID, aID, "running")
+
+	if _, err := svc.SetStatus(ctx, &coreapi.SetRunStatusRequest{
+		RunId:  &coreapi.UUID{Value: runID},
+		Status: enumrs.RunStatus_error,
+	}); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+
+	if _, err := svc.MarkDone(ctx, &coreapi.MarkRunDoneRequest{
+		RunId:     &coreapi.UUID{Value: runID},
+		Resumable: true, // must have no bearing on status at all (2a)
+	}); err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+
+	var statusText string
+	if err := pool.QueryRow(ctx, `SELECT status FROM run WHERE run_id = $1::uuid`, runID).Scan(&statusText); err != nil {
+		t.Fatalf("select status: %v", err)
+	}
+	if statusText != "error" {
+		t.Errorf("status = %q, want error (MarkDone must not overwrite)", statusText)
 	}
 }
 

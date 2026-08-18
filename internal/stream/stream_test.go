@@ -156,3 +156,69 @@ func TestXReadFrom_BlockTimeoutReturnsEmpty(t *testing.T) {
 		t.Errorf("expected ~100ms block, elapsed only %v", elapsed)
 	}
 }
+
+// TestLastID_MissingStream verifies the (finding-2 fix-round-1) fallback:
+// LastID must return the concrete sentinel "0-0" (never the literal "$")
+// for a stream that does not exist yet, so a caller resolving the tail once
+// up front still starts from a valid, replay-from-beginning ID rather than
+// handing an unresolved sentinel into a blocking XREAD loop.
+func TestLastID_MissingStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Redis testcontainer test in short mode")
+	}
+	ctx := context.Background()
+	rdb := startRedis(t)
+	s := stream.NewStreamer(rdb)
+
+	id, err := s.LastID(ctx, "test:lastid-missing")
+	if err != nil {
+		t.Fatalf("LastID: %v", err)
+	}
+	if id != "0-0" {
+		t.Errorf("LastID on missing stream = %q, want %q", id, "0-0")
+	}
+}
+
+// TestLastID_ReturnsMostRecentEntry verifies LastID resolves to the exact ID
+// of the most recently added entry — this is the fix-round-1 replacement for
+// handing the "$" sentinel into XReadFrom: "$" is re-resolved by Redis fresh
+// on every blocking call, so a client that re-issues it across multiple
+// re-arms can silently miss entries appended between calls (finding 2).
+// Resolving to a concrete ID ONCE, as tested here, eliminates that class of
+// bug by construction: the caller never holds "$" as a cursor value at all.
+func TestLastID_ReturnsMostRecentEntry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Redis testcontainer test in short mode")
+	}
+	ctx := context.Background()
+	rdb := startRedis(t)
+	s := stream.NewStreamer(rdb)
+	key := "test:lastid-present"
+
+	var lastID string
+	for i := 0; i < 3; i++ {
+		id, err := s.XAdd(ctx, key, map[string]any{"seq": fmt.Sprintf("%d", i)}, 1000)
+		if err != nil {
+			t.Fatalf("XAdd: %v", err)
+		}
+		lastID = id
+	}
+
+	id, err := s.LastID(ctx, key)
+	if err != nil {
+		t.Fatalf("LastID: %v", err)
+	}
+	if id != lastID {
+		t.Errorf("LastID = %q, want %q (the 3rd XAdd's ID)", id, lastID)
+	}
+
+	// Reading exclusively from LastID must yield zero entries — proving it is
+	// the true tail, not an earlier entry.
+	entries, err := s.XReadFrom(ctx, key, id, 10, 0)
+	if err != nil {
+		t.Fatalf("XReadFrom from LastID: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("XReadFrom from LastID returned %d entries, want 0 (LastID must be the tail)", len(entries))
+	}
+}

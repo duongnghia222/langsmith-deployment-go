@@ -1,11 +1,14 @@
 package assistants
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 
 	coreapi "github.com/duongnghia222/langsmith-deployment-go/gen/core_api"
 	engcommon "github.com/duongnghia222/langsmith-deployment-go/gen/engine_common"
+	"github.com/duongnghia222/langsmith-deployment-go/internal/crons"
 	"github.com/duongnghia222/langsmith-deployment-go/internal/jsonbutil"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc/codes"
@@ -165,18 +168,73 @@ func toVersionPB(v *AssistantVersion) *coreapi.AssistantVersion {
 // decodeConfig deserializes the JSONB config column into an EngineRunnableConfig.
 // Returns (nil, false) when the column is empty / "{}" / unparseable so callers
 // leave the proto's Config field unset rather than emitting a zero-value message.
+//
+// (5f) New rows store config as the Python-shaped dict config.py's
+// config_from_proto produces (crons.ConfigProtoToDict is the Go port,
+// shared with cron.payload's config field — see jsonbutil's package doc).
+// Rows written before 5f are protojson-shaped EngineRunnableConfig messages
+// instead; isLegacyConfigShape detects and handles that legacy shape.
 func decodeConfig(raw []byte) (*engcommon.EngineRunnableConfig, bool) {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) {
 		return nil, false
 	}
-	cfg := &engcommon.EngineRunnableConfig{}
-	if err := jsonbutil.Unmarshal(raw, cfg); err != nil {
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil || len(fields) == 0 {
 		return nil, false
 	}
-	if proto.Equal(cfg, &engcommon.EngineRunnableConfig{}) {
+
+	var cfg *engcommon.EngineRunnableConfig
+	if isLegacyConfigShape(fields) {
+		cfg = &engcommon.EngineRunnableConfig{}
+		if err := jsonbutil.Unmarshal(trimmed, cfg); err != nil {
+			return nil, false
+		}
+	} else {
+		var dict map[string]any
+		if err := json.Unmarshal(trimmed, &dict); err != nil {
+			return nil, false
+		}
+		cfg = crons.ConfigDictToProto(dict)
+	}
+	if cfg == nil || proto.Equal(cfg, &engcommon.EngineRunnableConfig{}) {
 		return nil, false
 	}
 	return cfg, true
+}
+
+// legacyOnlyConfigKeys are EngineRunnableConfig protojson field names
+// (UseProtoNames) that config.py's config_from_proto never places at the
+// top level of a Python config dict — it either nests them under
+// "configurable"/"metadata" (e.g. extra_configurable_json's entries land in
+// configurable, graph_id/thread_id/etc. are configurable-only) or doesn't
+// port them at all (runtime, resume_map). A row carrying any of these keys
+// at the top level must be a pre-5f protojson-shaped row.
+//
+// tags/run_name/max_concurrency/recursion_limit/run_id are deliberately
+// excluded: config_from_proto also uses those exact names for legitimate
+// top-level dict keys (config.py:59-70, KNOWN_CONFIG_KEYS), so they can't
+// disambiguate the shape.
+var legacyOnlyConfigKeys = map[string]bool{
+	"metadata_json": true, "extra_json": true, "extra_configurable_json": true,
+	"runtime": true, "resuming": true, "task_id": true, "thread_id": true,
+	"checkpoint_map": true, "checkpoint_id": true, "checkpoint_ns": true,
+	"durability": true, "resume_map": true, "graph_id": true,
+	"root_stream_modes": true, "run_attempt": true, "server_run_id": true,
+	"tracing_project": true, "tracing_example_id": true,
+}
+
+// isLegacyConfigShape reports whether raw stored config JSON is protojson
+// EngineRunnableConfig-shaped (pre-5f) rather than the Python-dict shape
+// written by crons.ConfigProtoToDict.
+func isLegacyConfigShape(m map[string]json.RawMessage) bool {
+	for k := range m {
+		if legacyOnlyConfigKeys[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // Create implements AssistantsServer.Create.
@@ -191,18 +249,21 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateAssistantReques
 		Name:        req.GetName(),
 		Metadata:    req.GetMetadataJson(),
 		ContextJSON: req.GetContextJson(),
+		Filters:     req.GetFilters(),
 	}
 	if req.GetConfig() != nil {
-		b, err := jsonbutil.Marshal(req.GetConfig())
+		// (5f) Store config as the Python-shaped dict ops.py's Jsonb(config)
+		// stores verbatim, not protojson — see crons.ConfigProtoToDict's doc.
+		b, err := json.Marshal(crons.ConfigProtoToDict(req.GetConfig()))
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 		in.Config = b
 	}
-	if req.GetDescription() != "" {
-		desc := req.GetDescription()
-		in.Description = &desc
-	}
+	// (5e) Description is presence-tracked (*string): pass through directly
+	// so an explicit "" is stored as empty, not dropped as if absent
+	// (ops.py:334/354 always includes description in the INSERT params).
+	in.Description = req.Description
 
 	// Forward if_exists to the atomic store (ops.py:356-374).
 	if req.GetIfExists() == coreapi.OnConflictBehavior_DO_NOTHING {
@@ -221,22 +282,26 @@ func (s *Service) Create(ctx context.Context, req *coreapi.CreateAssistantReques
 // Patch implements AssistantsServer.Patch.
 func (s *Service) Patch(ctx context.Context, req *coreapi.PatchAssistantRequest) (*coreapi.Assistant, error) {
 	in := PatchInput{
-		Name:        req.GetName(),
+		// (5e) Name is presence-tracked (*string) on PatchAssistantRequest —
+		// pass the pointer through directly so an explicit "" clears the
+		// name (ops.py:457-458: `if name is not None`) instead of being
+		// treated as absent.
+		Name:        req.Name,
 		Metadata:    req.GetMetadataJson(),
 		ContextJSON: req.GetContextJson(),
 		GraphID:     req.GetGraphId(),
 	}
 	if req.GetConfig() != nil {
-		b, err := jsonbutil.Marshal(req.GetConfig())
+		// (5f) Store config as the Python-shaped dict — see Create's comment.
+		b, err := json.Marshal(crons.ConfigProtoToDict(req.GetConfig()))
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 		in.Config = b
 	}
-	if req.GetDescription() != "" {
-		desc := req.GetDescription()
-		in.Description = &desc
-	}
+	// (5e) Description is presence-tracked: pass through directly (ops.py:460-461:
+	// `if description is not None`) so an explicit "" clears it.
+	in.Description = req.Description
 	a, err := s.store.Patch(ctx, req.GetAssistantId(), in, req.GetFilters())
 	if err != nil {
 		return nil, mapErr(err)
@@ -245,8 +310,12 @@ func (s *Service) Patch(ctx context.Context, req *coreapi.PatchAssistantRequest)
 }
 
 // Delete implements AssistantsServer.Delete.
+//
+// (5b) delete_threads: when set, the store also removes threads tagged with
+// this assistant_id in the same transaction (thread FK cascades handle
+// runs/checkpoints) — no Python parity for this LSD-only convenience flag.
 func (s *Service) Delete(ctx context.Context, req *coreapi.DeleteAssistantRequest) (*coreapi.DeleteAssistantsResponse, error) {
-	ids, err := s.store.Delete(ctx, req.GetAssistantId(), req.GetFilters())
+	ids, err := s.store.Delete(ctx, req.GetAssistantId(), req.GetDeleteThreads(), req.GetFilters())
 	if err != nil {
 		return nil, mapErr(err)
 	}
